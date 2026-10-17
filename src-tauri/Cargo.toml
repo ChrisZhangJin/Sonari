@@ -1,0 +1,24 @@
+[package]
+name = "sonari"
+version.workspace = true
+edition.workspace = true
+description = "Sonari desktop (Tauri 2): native window + engine in one exe"
+
+[lib]
+name = "sonari_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+# 关键：release 打包必须开 custom-protocol，否则 exe 以 dev 模式运行
+# （去连 devUrl 的 vite dev server），窗口永远空白。
+[features]
+custom-protocol = ["tauri/custom-protocol"]
+
+[build-dependencies]
+tauri-build.workspace = true
+
+[dependencies]
+sonari-engine.workspace = true
+tauri.workspace = true
+tauri-plugin-dialog.workspace = true
+tokio.workspace = true
+serde_json.workspace = true

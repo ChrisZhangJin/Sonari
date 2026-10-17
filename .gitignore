@@ -1,0 +1,32 @@
+# ---- Rust 构建产物（target/ 可达 4 GB+）----
+target/
+**/target/
+src-tauri/target/
+
+# ---- Node ----
+node_modules/
+ui/node_modules/
+
+# ---- 前端构建产物（编译期嵌入 exe，不入库）----
+ui/dist/
+
+# ---- 二进制产物 ----
+*.exe
+*.dll
+*.pdb
+*.msi
+*.dmg
+*.AppImage
+
+# ---- 第三方源码的本地参考副本（逆向用）----
+_ref/
+
+# ---- 本地临时文件 ----
+*.log
+.workbuddy/
+.DS_Store
+Thumbs.db
+
+# ---- 编辑器 ----
+.vscode/
+.idea/

@@ -1,0 +1,19 @@
+[package]
+name = "sonari-engine"
+version.workspace = true
+edition.workspace = true
+description = "Audio engine for sonari: document model, decode, DSP, analysis — the libocen/libiaudio/libdspb equivalent"
+
+[dependencies]
+symphonia.workspace = true
+rustfft.workspace = true
+realfft.workspace = true
+rubato.workspace = true
+ebur128.workspace = true
+cpal.workspace = true
+num-complex = "0.4"
+serde.workspace = true
+serde_json.workspace = true
+base64 = "0.22"
+thiserror.workspace = true
+anyhow.workspace = true

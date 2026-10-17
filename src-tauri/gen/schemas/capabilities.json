@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"Sonari 主窗口默认权限：核心能力 + 文件选择对话框 + 窗口关闭","local":true,"windows":["main"],"permissions":["core:default","dialog:default","core:window:allow-close"]}}
