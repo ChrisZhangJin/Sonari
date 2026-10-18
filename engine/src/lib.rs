@@ -39,6 +39,7 @@ pub const WRITE_CMDS: &[&str] = &[
     "doc_channels",
     "doc_rename",
     "doc_save",
+    "doc_paste",
 ];
 
 pub fn is_audio_cmd(cmd: &str) -> bool {

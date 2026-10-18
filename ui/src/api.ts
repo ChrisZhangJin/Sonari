@@ -1,11 +1,7 @@
-/** 引擎命令总线客户端 —— 双模式：
- *  - 桌面（Tauri 2）：invoke() 直调 Rust 命令（同进程，无网络）
- *  - 浏览器 / dev：WebSocket JSON 帧连 sonari-server
- *  两种模式共用 `sonari_engine::commands`，契约一致。 */
+/** 引擎命令总线客户端 —— Tauri 2 桌面模式：invoke() 直调 Rust 命令（同进程，无网络）。 */
 import { invoke } from '@tauri-apps/api/core';
 
-export const IS_TAURI =
-  typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+export const IS_TAURI = true;
 
 export interface DocInfo {
   sampleRate: number;
@@ -104,63 +100,13 @@ export interface ConstellationResult {
   frames_analyzed: number;
 }
 
-type Pending = { resolve: (v: any) => void; reject: (e: any) => void };
-
 export class Engine {
-  private ws: WebSocket | null = null;
-  private seq = 1;
-  private pending = new Map<number, Pending>();
-  url: string;
-
-  constructor(url = 'ws://127.0.0.1:9712') {
-    this.url = url;
-  }
-
-  connect(): Promise<void> {
-    if (IS_TAURI) return Promise.resolve();
-    return new Promise((resolve, reject) => {
-      const ws = new WebSocket(this.url);
-      ws.onopen = () => {
-        this.ws = ws;
-        resolve();
-      };
-      ws.onerror = () => reject(new Error(`无法连接 ${this.url}`));
-      ws.onmessage = (ev) => {
-        try {
-          const m = JSON.parse(ev.data);
-          const p = this.pending.get(m.id);
-          if (p) {
-            this.pending.delete(m.id);
-            if (m.ok) p.resolve(m.data);
-            else p.reject(new Error(m.error ?? 'engine error'));
-          }
-        } catch {
-          /* 忽略坏帧 */
-        }
-      };
-    });
-  }
-
   private call<T>(cmd: string, params: Record<string, unknown> = {}): Promise<T> {
-    if (IS_TAURI) {
-      // 单一命令入口：Tauri 侧按 cmd 前缀路由（commands / audio）
-      // Tauri 命令 Err(String) 到前端可能是裸字符串，统一包成 Error 以便 e.message 可用
-      return invoke<T>('engine', {
-        cmd,
-        p: params as unknown as Record<string, unknown>,
-      }).catch((e: unknown) => {
-        throw new Error(errText(e));
-      });
-    }
-    const ws = this.ws;
-    if (!ws) return Promise.reject(new Error('not connected'));
-    const id = this.seq++;
-    return new Promise<T>((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
-      ws.send(JSON.stringify({ id, cmd, params }));
-      setTimeout(() => {
-        if (this.pending.delete(id)) reject(new Error(`${cmd} timeout`));
-      }, 120_000);
+    return invoke<T>('engine', {
+      cmd,
+      p: params as unknown as Record<string, unknown>,
+    }).catch((e: unknown) => {
+      throw new Error(errText(e));
     });
   }
 
@@ -198,6 +144,7 @@ export class Engine {
     docId: string;
     path?: string;
     format?: string;
+    sampleRate?: number;
     bitDepth?: number;
     bitrateKbps?: number;
     begin?: number;
@@ -246,6 +193,11 @@ export class Engine {
     f32leBase64: string;
   }): Promise<DocOpened> {
     return this.call('doc_open_data', o);
+  }
+
+  /** 「粘贴 PCM」：在文档指定帧位置插入 f32le base64 数据 */
+  docPaste(docId: string, frame: number, f32leBase64: string): Promise<DocOpened> {
+    return this.call('doc_paste', { docId, frame, f32leBase64 });
   }
 
   // ---- 音频设备（cpal） ----

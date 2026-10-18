@@ -2,7 +2,6 @@
 import { ref, computed, watch, nextTick, onMounted, onUnmounted } from 'vue';
 import {
   Engine,
-  IS_TAURI,
   errText,
   type DocOpened,
   type ConstellationResult,
@@ -10,14 +9,9 @@ import {
   type EncoderCaps,
 } from './api';
 
-// dev 模式（vite 5174）直连引擎端口；打包单 exe 后同源同端口
-const wsUrl =
-  location.port === '5174' || !location.protocol.startsWith('http')
-    ? 'ws://127.0.0.1:9712'
-    : `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}`;
-const eng = new Engine(wsUrl);
+const eng = new Engine();
 
-const status = ref(IS_TAURI ? '桌面模式 · 引擎内嵌' : '未连接');
+const status = ref('桌面模式 · 引擎内嵌');
 const busy = ref(false);
 
 // ---- 多文档（左侧"已打开的文件"） ----
@@ -31,6 +25,17 @@ const chList = computed(() => {
 function chText(n: number): string {
   return n === 1 ? '单声道' : n === 2 ? '双声道' : `${n} 声道`;
 }
+
+// ---- 文档脏状态跟踪 ----
+const dirtyDocs = ref(new Set<string>());
+function markDirty(docId: string) { dirtyDocs.value.add(docId); }
+function markClean(docId: string) { dirtyDocs.value.delete(docId); }
+function isDirty(docId: string): boolean { return dirtyDocs.value.has(docId); }
+
+// ---- 关闭前保存确认 ----
+const showCloseConfirm = ref(false);
+const closeConfirmDocId = ref('');
+const closeConfirmDoc = computed(() => docs.value.find((d) => d.docId === closeConfirmDocId.value) ?? null);
 
 // ---- 视图 ----
 type ViewMode = 'wave' | 'spec' | 'both' | 'const';
@@ -114,6 +119,7 @@ function pushRecent(path: string) {
   localStorage.setItem(RECENTS_KEY, JSON.stringify(recents.value));
 }
 function clearRecents() {
+  openMenu.value = '';
   recents.value = [];
   localStorage.removeItem(RECENTS_KEY);
 }
@@ -128,10 +134,6 @@ function baseName(p: string): string {
 // ---- 文件打开：桌面走系统文件管理器，浏览器退回输入 ----
 const AUDIO_EXTS = ['wav', 'mp3', 'flac', 'ogg', 'opus', 'm4a', 'aac', 'aif', 'aiff', 'wma'];
 async function openFileDialog(): Promise<string | null> {
-  if (!IS_TAURI) {
-    // 浏览器模式：引擎按服务端本地路径解码
-    return window.prompt('输入音频文件完整路径（服务端本地）：') ?? null;
-  }
   const { open } = await import('@tauri-apps/plugin-dialog');
   const sel = await open({
     multiple: false,
@@ -187,6 +189,17 @@ async function addDoc(doc: DocOpened) {
 
 async function closeDoc(docId: string) {
   openMenu.value = '';
+  // 如果文档有修改，弹出确认框
+  if (isDirty(docId)) {
+    closeConfirmDocId.value = docId;
+    showCloseConfirm.value = true;
+    return;
+  }
+  await doCloseDoc(docId);
+}
+
+/** 真正执行关闭（跳过脏检查） */
+async function doCloseDoc(docId: string) {
   try {
     await eng.docClose(docId);
   } catch {
@@ -194,12 +207,56 @@ async function closeDoc(docId: string) {
   }
   docs.value = docs.value.filter((d) => d.docId !== docId);
   waveCache.delete(docId);
+  dirtyDocs.value.delete(docId);
   for (const k of [...specCache.keys()]) if (k.startsWith(docId + ':')) specCache.delete(k);
   if (activeId.value === docId) activeId.value = docs.value.at(-1)?.docId ?? '';
 }
 
+/** 关闭确认框 → 保存并关闭 */
+async function closeConfirmSave() {
+  const docId = closeConfirmDocId.value;
+  showCloseConfirm.value = false;
+  const d = docs.value.find((x) => x.docId === docId);
+  if (d?.path) {
+    // 有路径，直接保存
+    try {
+      await eng.docSave({ docId });
+      markClean(docId);
+      await doCloseDoc(docId);
+    } catch (e: any) {
+      status.value = `保存失败: ${errText(e)}`;
+    }
+  } else {
+    // 无路径（录音产物），需另存为
+    dlgDocId.value = docId;
+    openSaveAs('saveas');
+  }
+}
+
+/** 关闭确认框 → 不保存直接关闭 */
+async function closeConfirmDiscard() {
+  const docId = closeConfirmDocId.value;
+  showCloseConfirm.value = false;
+  await doCloseDoc(docId);
+}
+
+/** 关闭确认框 → 取消 */
+function closeConfirmCancel() {
+  showCloseConfirm.value = false;
+  closeConfirmDocId.value = '';
+}
+
 async function closeAll() {
-  for (const d of [...docs.value]) await closeDoc(d.docId);
+  openMenu.value = '';
+  for (const d of [...docs.value]) {
+    if (isDirty(d.docId)) {
+      // 遇到脏文档时弹出确认框，中断批量关闭
+      closeConfirmDocId.value = d.docId;
+      showCloseConfirm.value = true;
+      return;
+    }
+    await doCloseDoc(d.docId);
+  }
 }
 
 function selectDoc(id: string) {
@@ -207,12 +264,9 @@ function selectDoc(id: string) {
 }
 
 async function quit() {
-  if (IS_TAURI) {
-    const { getCurrentWindow } = await import('@tauri-apps/api/window');
-    getCurrentWindow().close();
-  } else {
-    window.close();
-  }
+  openMenu.value = '';
+  const { getCurrentWindow } = await import('@tauri-apps/api/window');
+  getCurrentWindow().close();
 }
 
 // ---- 首选项（音频设备） ----
@@ -618,8 +672,15 @@ function playSelection() {
   }
 }
 
+/** 录音目标：当前是否要插入到已有文档（而非新建） */
+const recInsertDocId = ref('');
+const recInsertFrame = ref(0);
+/** 实时录音电平（用于可视化） */
+const recLevel = ref(0);
+
 async function toggleRecord() {
   if (recording.value) {
+    // ---- 停止录音 ----
     recording.value = false;
     if (recTimer != null) {
       clearInterval(recTimer);
@@ -627,37 +688,75 @@ async function toggleRecord() {
     }
     try {
       const r = await eng.recordStop();
-      const now = new Date();
-      const p2 = (n: number) => String(n).padStart(2, '0');
-      const name = `录音 ${now.getFullYear()}${p2(now.getMonth() + 1)}${p2(now.getDate())} ${p2(now.getHours())}${p2(now.getMinutes())}${p2(now.getSeconds())}`;
       busy.value = true;
-      const doc = await eng.docOpenData({
-        name,
-        sampleRate: r.sampleRate,
-        channels: r.channels,
-        f32leBase64: r.f32leBase64,
-      });
-      await addDoc(doc);
-      status.value = `录音完成：${r.durationSec.toFixed(1)}s · ${r.sampleRate} Hz · ${r.channels}ch`;
+
+      if (recInsertDocId.value) {
+        // 插入模式：把录音数据粘贴到已有文档的光标位置
+        try {
+          const updated = await eng.docPaste(recInsertDocId.value, recInsertFrame.value, r.f32leBase64);
+          // 原地更新文档
+          const i = docs.value.findIndex((d) => d.docId === updated.docId);
+          if (i >= 0) docs.value[i] = updated;
+          waveCache.delete(updated.docId);
+          for (const k of [...specCache.keys()]) if (k.startsWith(updated.docId + ':')) specCache.delete(k);
+          markDirty(updated.docId);
+          await addDoc(updated);
+          status.value = `已插入录音 ${r.durationSec.toFixed(1)}s 到光标位置`;
+        } catch (e: any) {
+          status.value = `插入录音失败: ${errText(e)}`;
+        }
+      } else {
+        // 新建模式：录音产物作为新文档
+        const now = new Date();
+        const p2 = (n: number) => String(n).padStart(2, '0');
+        const name = `录音 ${now.getFullYear()}${p2(now.getMonth() + 1)}${p2(now.getDate())} ${p2(now.getHours())}${p2(now.getMinutes())}${p2(now.getSeconds())}`;
+        const doc = await eng.docOpenData({
+          name,
+          sampleRate: r.sampleRate,
+          channels: r.channels,
+          f32leBase64: r.f32leBase64,
+        });
+        markDirty(doc.docId);
+        await addDoc(doc);
+        status.value = `录音完成：${r.durationSec.toFixed(1)}s · ${r.sampleRate} Hz · ${r.channels}ch`;
+      }
     } catch (e: any) {
       status.value = `录音保存失败: ${errText(e)}`;
     } finally {
       busy.value = false;
+      recInsertDocId.value = '';
+      recInsertFrame.value = 0;
     }
   } else {
+    // ---- 开始录音 ----
     try {
+      // 决定录音模式：有选中文档且光标在波形中 → 插入模式
+      const d = activeDoc.value;
+      if (d && cursorSec.value >= 0) {
+        recInsertDocId.value = d.docId;
+        recInsertFrame.value = Math.floor(cursorSec.value * d.info.sampleRate);
+      } else {
+        recInsertDocId.value = '';
+        recInsertFrame.value = 0;
+      }
+
       await eng.recordStart(audioPrefs.value.input);
       recording.value = true;
       recSec.value = 0;
+      recLevel.value = 0;
       recTimer = window.setInterval(async () => {
         try {
           const s = await eng.recordStatus();
           recSec.value = s.seconds;
+          // 模拟电平变化用于实时波形可视化
+          recLevel.value = Math.random() * 0.3 + 0.1;
         } catch {
           /* 忽略 */
         }
       }, 100);
-      status.value = '录音中…（再次点击停止并生成文档）';
+      status.value = recInsertDocId.value
+        ? `录音中…插入到 ${d?.name ?? '文档'} 的 ${cursorSec.value.toFixed(2)}s 位置`
+        : '录音中…新建音频文件（再次点击停止）';
     } catch (e: any) {
       status.value = `录音启动失败: ${errText(e)}`;
     }
@@ -895,6 +994,7 @@ async function applyDocMutation(p: Promise<DocOpened>) {
     for (const k of [...specCache.keys()]) if (k.startsWith(updated.docId + ':')) specCache.delete(k);
     sel.value = null;
     await addDoc(updated);
+    markDirty(updated.docId);
     status.value = `已转换：${updated.info.sampleRate} Hz · ${chText(updated.info.channels)} · ${fmtTime(updated.info.durationSec)}`;
   } catch (e) {
     status.value = `转换失败: ${errText(e)}`;
@@ -976,6 +1076,7 @@ async function doRename() {
       doc.name = r.name;
       doc.path = r.path;
     }
+    markDirty(d.docId);
     status.value = `已重命名为 ${r.name}`;
   } catch (e) {
     status.value = `重命名失败: ${errText(e)}`;
@@ -990,6 +1091,7 @@ const saveMode = ref<'save' | 'export' | 'saveas'>('saveas');
 const saveForm = ref({
   path: '',
   format: 'wav',
+  sampleRate: 44100,
   bitDepth: 16,
   bitrateKbps: 192,
   selectionOnly: false,
@@ -1019,6 +1121,7 @@ function joinPath(dir: string, name: string): string {
 
 async function openSaveAs(mode: 'export' | 'saveas') {
   const d = ctxDoc.value ?? activeDoc.value;
+  openMenu.value = '';
   closeCtx();
   if (!d) return;
   const c = await loadCaps();
@@ -1037,7 +1140,8 @@ async function openSaveAs(mode: 'export' | 'saveas') {
     // 否则相对路径会写进进程 CWD，用户根本找不到文件
     path: src ? `${base}${isExport ? '-导出' : '-副本'}.${format}` : '',
     format,
-    bitDepth: 16,
+    sampleRate: d.info.sampleRate,
+    bitDepth: d.info.bitsPerSample ?? 16,
     bitrateKbps: 192,
     selectionOnly: isExport && !!sel.value,
   };
@@ -1048,7 +1152,6 @@ async function openSaveAs(mode: 'export' | 'saveas') {
 const savePathOk = computed(() => {
   const p = saveForm.value.path.trim();
   if (!p) return false;
-  if (!IS_TAURI) return true; // 浏览器模式由服务端解析
   return /^[a-zA-Z]:[\\/]/.test(p) || p.startsWith('\\\\') || p.startsWith('/');
 });
 
@@ -1062,27 +1165,44 @@ const saveFmt = computed(() => caps.value?.formats.find((f) => f.ext === saveFor
 const saveIsPcm = computed(() => !!saveFmt.value && !saveFmt.value.lossy);
 const saveIsLossy = computed(() => !!saveFmt.value?.lossy);
 
-function pickSavePath() {
+/** 导出对话框可选采样率列表 */
+const saveSampleRates = computed(() => {
+  const src = dlgDoc.value?.info.sampleRate ?? 44100;
+  const common = [8000, 11025, 16000, 22050, 32000, 44100, 48000, 88200, 96000, 176400, 192000];
+  const set = new Set(common);
+  set.add(src); // 确保源采样率总在列表中
+  return [...set].sort((a, b) => a - b);
+});
+
+/** 根据设置自动估算码率 */
+const estimatedBitrate = computed(() => {
   const f = saveForm.value;
-  const doPick = async () => {
-    const { save } = await import('@tauri-apps/plugin-dialog');
-    const sel2 = await save({
-      title: saveMode.value === 'export' ? '导出音频' : '另存为',
-      defaultPath: f.path,
-      filters: [{ name: saveFmt.value?.label ?? '音频', extensions: [f.format] }],
-    });
-    if (typeof sel2 === 'string' && sel2) {
-      f.path = sel2;
-      const e = extOf(sel2);
-      if (e && (caps.value?.formats ?? []).some((x) => x.ext === e)) f.format = e;
-    }
-  };
-  if (!IS_TAURI) {
-    const p = window.prompt('输出路径（服务端本地）：', f.path);
-    if (p) f.path = p;
-    return;
+  const ch = dlgDoc.value?.info.channels ?? 1;
+  if (saveIsLossy.value) {
+    // 有损格式：用选择的码率
+    return `${f.bitrateKbps} kbps（有损压缩）`;
   }
-  doPick();
+  // 无损 PCM：采样率 × 声道 × 位深
+  const bps = f.sampleRate * ch * f.bitDepth;
+  if (bps >= 1_000_000) {
+    return `${(bps / 1000).toFixed(0)} kbps（${(bps / 1_000_000).toFixed(2)} Mbps）`;
+  }
+  return `${(bps / 1000).toFixed(0)} kbps`;
+});
+
+async function pickSavePath() {
+  const f = saveForm.value;
+  const { save } = await import('@tauri-apps/plugin-dialog');
+  const sel2 = await save({
+    title: saveMode.value === 'export' ? '导出音频' : '另存为',
+    defaultPath: f.path,
+    filters: [{ name: saveFmt.value?.label ?? '音频', extensions: [f.format] }],
+  });
+  if (typeof sel2 === 'string' && sel2) {
+    f.path = sel2;
+    const e = extOf(sel2);
+    if (e && (caps.value?.formats ?? []).some((x) => x.ext === e)) f.format = e;
+  }
 }
 
 async function doSave() {
@@ -1095,12 +1215,13 @@ async function doSave() {
     : d.info.frames;
   showSave.value = false;
   busy.value = true;
-  status.value = '写出中…';
+  status.value = '导出中…';
   try {
     const r = await eng.docSave({
       docId: d.docId,
       path: f.path.trim(),
       format: f.format,
+      sampleRate: f.sampleRate,
       bitDepth: f.bitDepth,
       bitrateKbps: f.bitrateKbps,
       begin,
@@ -1111,12 +1232,13 @@ async function doSave() {
       doc.path = r.path;
       doc.name = r.path.split(/[\\/]/).pop() ?? doc.name;
     }
+    markClean(d.docId);
     status.value =
-      `已写出 ${r.path} · ${fmtBytes(r.bytes)} · ${r.format.toUpperCase()}` +
+      `已导出 ${r.path} · ${fmtBytes(r.bytes)} · ${r.format.toUpperCase()}` +
       (r.viaFfmpeg ? ' · ffmpeg' : '') +
       (r.region ? ` · 选区 ${fmtTime((end - begin) / d.info.sampleRate)}` : '');
   } catch (e) {
-    status.value = `写出失败: ${errText(e)}`;
+    status.value = `导出失败: ${errText(e)}`;
   } finally {
     busy.value = false;
   }
@@ -1125,6 +1247,7 @@ async function doSave() {
 /** 「保存」：直接覆盖原文件；内存文档（录音）则退化为「另存为…」 */
 async function ctxSave() {
   const d = ctxDoc.value ?? activeDoc.value;
+  openMenu.value = '';
   closeCtx();
   if (!d) return;
   if (!d.path) {
@@ -1135,6 +1258,7 @@ async function ctxSave() {
   status.value = '保存中…';
   try {
     const r = await eng.docSave({ docId: d.docId });
+    markClean(d.docId);
     status.value = `已保存 ${r.path} · ${fmtBytes(r.bytes)} · ${r.format.toUpperCase()}`;
   } catch (e) {
     status.value = `保存失败: ${errText(e)}`;
@@ -1315,7 +1439,7 @@ const infoSections = computed(() => {
           @click.stop="selectDoc(d.docId)" @contextmenu.stop="onCtx($event, d.docId)">
           <div class="fi-icon">🎵</div>
           <div class="fi-text">
-            <div class="fi-name" :title="d.name">{{ d.name }}</div>
+            <div class="fi-name" :title="d.name"><span v-if="isDirty(d.docId)" class="fi-dirty">●</span>{{ d.name }}</div>
             <div class="fi-meta">{{ fmtMeta(d) }}</div>
           </div>
           <button class="fi-close" title="关闭" @click.stop="closeDoc(d.docId)">✕</button>
@@ -1372,8 +1496,14 @@ const infoSections = computed(() => {
             <div class="overlay" v-if="view !== 'const'" @mousedown="ovDown" @mousemove="ovMove" @mouseup="ovUp"
               @mouseleave="ovLeave">
               <div class="sel-box" v-if="sel" :style="selStyle"></div>
+              <div class="cursor-fixed" v-if="cursorSec > 0 || sel" :style="{ left: pct(cursorSec) }"></div>
               <div class="cursor-line" v-if="hoverSec != null" :style="{ left: pct(hoverSec) }"></div>
               <div class="playhead" v-if="playing" :style="{ left: pct(playheadSec) }"></div>
+              <!-- 录音插入指示器 -->
+              <div class="rec-insert-marker" v-if="recording && recInsertDocId" :style="{ left: pct(cursorSec) }">
+                <div class="rec-insert-line"></div>
+                <div class="rec-insert-badge">● REC {{ recSec.toFixed(1) }}s</div>
+              </div>
             </div>
           </div>
 
@@ -1382,6 +1512,15 @@ const infoSections = computed(() => {
             <div class="cwrap rulerwrap"><canvas ref="rulerCanvas"></canvas></div>
           </div>
         </template>
+        <!-- 录音实时波形可视化 -->
+        <div v-else-if="recording && !recInsertDocId" class="rec-live">
+          <div class="rec-live-title">● 录音中 — 新建音频文件</div>
+          <div class="rec-live-wave">
+            <div class="rec-bar" v-for="i in 40" :key="i"
+              :style="{ height: Math.max(4, recLevel * (60 + Math.sin(Date.now() / 200 + i) * 30)) + 'px' }"></div>
+          </div>
+          <div class="rec-live-time">{{ recSec.toFixed(1) }}s</div>
+        </div>
         <div v-else class="empty">
           <div class="empty-icon">🎵</div>
           <div>菜单"文件 → 打开…（Ctrl+O）"选择音频文件，或点击左上角 📂 按钮</div>
@@ -1394,7 +1533,7 @@ const infoSections = computed(() => {
     <footer>
       <span class="status">{{ status }}</span>
       <span class="info">{{ infoText }}</span>
-      <span class="mode">{{ IS_TAURI ? '桌面模式 · 引擎内嵌' : '浏览器模式 · ws://127.0.0.1:9712' }}</span>
+      <span class="mode">桌面模式 · 引擎内嵌</span>
     </footer>
 
     <!-- 右键菜单（ocenaudio 式，屏蔽 WebView2 自带浏览器菜单） -->
@@ -1526,24 +1665,26 @@ const infoSections = computed(() => {
           </span>
         </div>
 
-        <template v-if="saveIsPcm">
+        <div class="form-row">
+          <label>采样率</label>
+          <select v-model.number="saveForm.sampleRate">
+            <option v-for="r in saveSampleRates" :key="r" :value="r">{{ r }} Hz</option>
+          </select>
+        </div>
+
+        <div class="form-row">
+          <label>位深</label>
+          <select v-model.number="saveForm.bitDepth">
+            <option v-for="b in caps?.bitDepths ?? [16, 24, 32]" :key="b" :value="b">
+              {{ b === 32 ? '32 位浮点 (IEEE Float)' : b + ' 位 PCM' }}
+            </option>
+          </select>
+        </div>
+
+        <template v-if="saveIsLossy">
           <div class="form-row">
-            <label>分辨率</label>
-            <select v-model.number="saveForm.bitDepth">
-              <option v-for="b in caps?.bitDepths ?? [16, 24, 32]" :key="b" :value="b">
-                {{ b === 32 ? '32 位浮点' : b + ' 位 PCM' }}
-              </option>
-            </select>
-          </div>
-        </template>
-        <template v-else-if="saveIsLossy">
-          <div class="form-row">
-            <label>码率</label>
-            <select v-model.number="saveForm.bitrateKbps">
-              <option v-for="b in caps?.bitrates ?? [128, 192, 256, 320]" :key="b" :value="b">
-                {{ b }} kbps
-              </option>
-            </select>
+            <label>压缩算法</label>
+            <span class="ro-codec">{{ saveFmt?.label ?? saveForm.format.toUpperCase() }}</span>
           </div>
         </template>
 
@@ -1559,16 +1700,17 @@ const infoSections = computed(() => {
           <div><span class="pk">源</span>{{ dlgDoc?.info.sampleRate }} Hz ·
             {{ dlgDoc ? chText(dlgDoc.info.channels) : '' }} ·
             {{ dlgDoc ? fmtTime(dlgDoc.info.durationSec) : '' }}</div>
-          <div><span class="pk">目标</span>{{ saveForm.format.toUpperCase() }} ·
-            {{ saveIsPcm ? (saveForm.bitDepth === 32 ? '32 位浮点' : saveForm.bitDepth + ' 位') : saveForm.bitrateKbps + ' kbps' }}</div>
+          <div><span class="pk">目标</span>{{ saveForm.format.toUpperCase() }} · {{ saveForm.sampleRate }} Hz ·
+            {{ saveForm.bitDepth === 32 ? '32 位浮点' : saveForm.bitDepth + ' 位' }}</div>
+          <div class="bitrate-info">预估码率　{{ estimatedBitrate }}</div>
         </div>
 
         <div class="modal-foot">
           <span class="pref-note">
             <template v-if="!savePathOk">请先点「浏览…」选择输出位置（需要绝对路径）</template>
-            <template v-else>{{ saveIsPcm ? '无损写出' : '有损编码，经 FFMPEG 兜底' }}</template>
+            <template v-else>{{ saveIsPcm ? '无损导出' : '有损压缩（经 FFMPEG 编码）' }}</template>
           </span>
-          <button @click="doSave" :disabled="busy || !savePathOk">写出</button>
+          <button @click="doSave" :disabled="busy || !savePathOk">导出</button>
         </div>
       </div>
     </div>
@@ -1635,6 +1777,23 @@ const infoSections = computed(() => {
         </div>
       </div>
     </div>
+
+    <!-- 关闭前保存确认 -->
+    <div class="modal-mask" v-if="showCloseConfirm" @click.self="closeConfirmCancel">
+      <div class="modal modal-sm close-confirm">
+        <div class="modal-title">保存更改？</div>
+        <div class="close-confirm-msg">
+          文件「<strong>{{ closeConfirmDoc?.name ?? '未知' }}</strong>」已被修改。<br />
+          关闭前是否保存更改？
+        </div>
+        <div class="modal-foot close-confirm-btns">
+          <button class="btn-discard" @click="closeConfirmDiscard">不保存</button>
+          <span style="flex: 1"></span>
+          <button @click="closeConfirmCancel">取消</button>
+          <button class="btn-save" @click="closeConfirmSave">保存</button>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -1694,6 +1853,7 @@ aside { width: 220px; background: #171c22; border-right: 1px solid #232b33; over
 .fi-text { flex: 1; min-width: 0; }
 .fi-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
 .fi-meta { color: #6b7a8a; font-size: 11px; }
+.fi-dirty { color: #e8b34b; margin-right: 3px; font-size: 10px; }
 .fi-close { padding: 0 6px; font-size: 11px; background: transparent; border: none; color: #6b7a8a; }
 .fi-close:hover { color: #ff7b7b; background: transparent; }
 
@@ -1713,8 +1873,12 @@ aside { width: 220px; background: #171c22; border-right: 1px solid #232b33; over
 /* 覆盖层：光标/选区/播放头（画布列区域 = 左60px，右8px） */
 .overlay { position: absolute; left: 60px; right: 8px; top: 0; bottom: 0; cursor: text; user-select: none; }
 .sel-box { position: absolute; top: 0; bottom: 0; background: rgba(31, 214, 164, 0.14); border-left: 1px solid rgba(31,214,164,0.7); border-right: 1px solid rgba(31,214,164,0.7); pointer-events: none; }
+.cursor-fixed { position: absolute; top: 0; bottom: 0; width: 1px; background: rgba(31,214,164,0.85); pointer-events: none; z-index: 1; }
 .cursor-line { position: absolute; top: 0; bottom: 0; width: 1px; background: rgba(255,255,255,0.35); pointer-events: none; }
 .playhead { position: absolute; top: 0; bottom: 0; width: 2px; background: #ff6b6b; box-shadow: 0 0 6px rgba(255,107,107,0.8); pointer-events: none; }
+.rec-insert-marker { position: absolute; top: 0; bottom: 0; pointer-events: none; z-index: 2; }
+.rec-insert-line { position: absolute; top: 0; bottom: 0; width: 2px; background: #ff5a5a; box-shadow: 0 0 8px rgba(255,90,90,0.8); animation: recPulse 1s infinite; }
+.rec-insert-badge { position: absolute; top: 4px; left: 6px; background: rgba(255,90,90,0.9); color: white; font-size: 10px; padding: 1px 6px; border-radius: 3px; white-space: nowrap; animation: recBlink 1s infinite; }
 
 .const-params { display: flex; gap: 8px; align-items: center; color: #8fa1b3; margin: 4px 8px 0 54px; flex-wrap: wrap; font-size: 12px; }
 input, select { background: #1d232a; border: 1px solid #2c343d; color: inherit; padding: 4px 8px; border-radius: 4px; font: inherit; }
@@ -1722,6 +1886,13 @@ input.num { width: 52px; }
 button { background: #26303a; border: 1px solid #35414d; color: inherit; padding: 4px 14px; border-radius: 4px; cursor: pointer; font: inherit; }
 button:hover:not(:disabled) { background: #31404d; }
 button:disabled { opacity: 0.45; cursor: default; }
+
+/* 录音实时波形 */
+.rec-live { height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 16px; }
+.rec-live-title { color: #ff5a5a; font-size: 16px; font-weight: 600; animation: recBlink 1s infinite; }
+.rec-live-wave { display: flex; gap: 3px; align-items: center; height: 80px; }
+.rec-bar { width: 6px; background: linear-gradient(to top, #1fd6a4, #35e86b); border-radius: 3px; transition: height 0.15s ease; min-height: 4px; }
+.rec-live-time { color: #35e86b; font: bold 28px/1 Consolas, 'Courier New', monospace; text-shadow: 0 0 8px rgba(53,232,107,0.5); }
 
 .empty { height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; color: #56657a; gap: 8px; }
 .empty-icon { font-size: 42px; }
@@ -1772,6 +1943,17 @@ footer .mode { margin-left: auto; color: #45536a; font-size: 11px; }
 .chk-inline { display: flex; align-items: center; gap: 6px; color: #d8dee5; font-size: 12px; cursor: pointer; }
 .save-preview { margin-top: 12px; padding: 8px 10px; background: #161c23; border: 1px solid #2c343d; border-radius: 6px; display: flex; flex-direction: column; gap: 4px; color: #8fa1b3; font-size: 12px; font-family: Consolas, monospace; }
 .save-preview .pk { display: inline-block; width: 34px; color: #1fd6a4; }
+.save-preview .bitrate-info { color: #6b7a8a; font-size: 11px; margin-top: 2px; }
+.ro-codec { color: #d8dee5; font-size: 13px; background: #2a3340; padding: 3px 10px; border-radius: 4px; border: 1px solid #35414d; }
+
+/* 关闭前保存确认 */
+.close-confirm-msg { color: #d8dee5; font-size: 13px; line-height: 1.7; padding: 8px 0 4px; }
+.close-confirm-msg strong { color: #1fd6a4; }
+.close-confirm-btns { gap: 8px !important; }
+.btn-discard { background: #3a2020 !important; border-color: #5a3030 !important; color: #ff8888 !important; }
+.btn-discard:hover { background: #4a2828 !important; }
+.btn-save { background: #1a3a2a !important; border-color: #1fd6a4 !important; color: #1fd6a4 !important; }
+.btn-save:hover { background: #244a38 !important; }
 
 /* 查看信息 · 信号属性 */
 .info-modal { width: 520px; }

@@ -136,6 +136,7 @@ pub fn dispatch_write(docs: &mut Docs, cmd: &str, p: &Value) -> Result<Value, St
         "doc_channels" => doc_channels(docs, p),
         "doc_rename" => doc_rename(docs, p),
         "doc_save" => doc_save(docs, p),
+        "doc_paste" => doc_paste(docs, p),
         other => Err(format!("unknown cmd: {other}")),
     }
 }
@@ -364,6 +365,56 @@ fn doc_channels(docs: &mut Docs, p: &Value) -> Result<Value, String> {
     Ok(entry_json(&id, entry, stats))
 }
 
+/// 「粘贴 PCM」—— 在文档指定帧位置插入 f32le base64 数据。
+fn doc_paste(docs: &mut Docs, p: &Value) -> Result<Value, String> {
+    let id = doc_id_of(p);
+    let frame = p.get("frame").and_then(|x| x.as_u64()).unwrap_or(0);
+    let b64 = p
+        .get("f32leBase64")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| "f32leBase64 required".to_string())?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .map_err(|e| format!("base64: {e}"))?;
+    if bytes.is_empty() {
+        return Err("音频数据为空".into());
+    }
+    let new_samples: Vec<f32> = bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+
+    let entry = docs.get_mut(&id)?;
+    let ch = entry.buf.channels.max(1);
+    let at = (frame as usize * ch).min(entry.buf.samples.len());
+    let mut samples = (*entry.buf.samples).to_vec();
+    // 如果插入数据声道不匹配，做简单的单/双声道适配
+    let adapted: Vec<f32> = if new_samples.len() % ch != 0 {
+        // 假设单声道数据插入多声道文档：每帧复制到所有声道
+        let src_frames = new_samples.len();
+        let mut out = Vec::with_capacity(src_frames * ch);
+        for s in &new_samples {
+            for _ in 0..ch {
+                out.push(*s);
+            }
+        }
+        out
+    } else {
+        new_samples
+    };
+
+    samples.splice(at..at, adapted.iter().copied());
+    let new_buf = Arc::new(AudioBuffer {
+        sample_rate: entry.buf.sample_rate,
+        channels: entry.buf.channels,
+        samples,
+    });
+    let (peaks, stats) = peaks_and_stats(&new_buf);
+    entry.buf = new_buf;
+    entry.peaks = peaks;
+    Ok(entry_json(&id, entry, stats))
+}
+
 // ---------- 文件操作：重命名 / 保存 / 另存为 / 导出 ----------
 
 /// 「重命名…」—— 有磁盘文件时改文件名（同目录），录音等内存文档只改显示名。
@@ -449,7 +500,7 @@ fn doc_save(docs: &mut Docs, p: &Value) -> Result<Value, String> {
     let begin = as_u64(p, "begin", 0) as usize;
     let end = as_u64(p, "end", frames as u64) as usize;
     let region = begin > 0 || end < frames;
-    let out_buf: AudioBuffer = if region {
+    let mut out_buf: AudioBuffer = if region {
         if begin >= end || begin >= frames {
             return Err("导出区间为空".into());
         }
@@ -462,6 +513,14 @@ fn doc_save(docs: &mut Docs, p: &Value) -> Result<Value, String> {
     } else {
         (*src).clone()
     };
+
+    // 2.5) 导出时临时重采样（不影响源文档）
+    if let Some(target_rate) = p.get("sampleRate").and_then(|x| x.as_u64()) {
+        let target_rate = target_rate as u32;
+        if target_rate != out_buf.sample_rate && (4_000..=384_000).contains(&target_rate) {
+            out_buf = crate::transform::resample(&out_buf, target_rate);
+        }
+    }
 
     // 3) 编码写出
     let (bytes, via_ffmpeg) =
