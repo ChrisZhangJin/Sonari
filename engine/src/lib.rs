@@ -17,6 +17,7 @@ pub mod decode;
 pub mod doc;
 pub mod dsp;
 pub mod encode;
+pub mod mss;
 pub mod transform;
 
 /// 音频命令（cpal 设备 / 播放 / 录音）——走 `AudioState` 而非文档锁。
@@ -40,6 +41,13 @@ pub const WRITE_CMDS: &[&str] = &[
     "doc_rename",
     "doc_save",
     "doc_paste",
+    "doc_cut",
+    "doc_copy",
+    "doc_paste_clip",
+    "doc_silence",
+    "doc_fade",
+    "doc_undo",
+    "doc_redo",
 ];
 
 pub fn is_audio_cmd(cmd: &str) -> bool {

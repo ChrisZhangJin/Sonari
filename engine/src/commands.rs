@@ -31,11 +31,28 @@ pub struct DocEntry {
     pub peaks: Vec<[f32; 2]>,
     /// 码流元数据（分辨率 / 编解码器 ——「查看信息」用）
     pub meta: StreamMeta,
+    /// 操作历史（快照式）：undo 栈顶 = 最近一次操作之前的音频
+    pub undo: Vec<HistItem>,
+    /// 被撤销的操作：栈顶 = 下一个可重做的
+    pub redo: Vec<HistItem>,
 }
+
+/// 一步历史：操作名 + 该操作「另一侧」的音频快照。
+/// 缓冲区是 `Arc` 不可变共享，每次编辑本来就生成新缓冲区，存快照不额外复制。
+pub struct HistItem {
+    pub label: String,
+    pub buf: Arc<AudioBuffer>,
+}
+
+/// 历史上限：步数 + 快照总样本数（约 1 GiB f32），超出丢最老的
+const HISTORY_MAX_STEPS: usize = 100;
+const HISTORY_MAX_SAMPLES: usize = 256 * 1024 * 1024;
 
 #[derive(Default)]
 pub struct Docs {
     inner: HashMap<String, DocEntry>,
+    /// 剪贴板（剪切 / 复制的音频），跨文档共享
+    clipboard: Option<Arc<AudioBuffer>>,
 }
 
 impl Docs {
@@ -110,7 +127,200 @@ fn entry_json(doc_id: &str, e: &DocEntry, stats: Option<Value>) -> Value {
         },
         "peaks": e.peaks.iter().flat_map(|pk| pk.iter().copied()).collect::<Vec<f32>>(),
         "stats": stats,
+        "history": history_json(e),
     })
+}
+
+/// 历史列表：undo 从旧到新，redo 从「下一个可重做」开始
+fn history_json(e: &DocEntry) -> Value {
+    json!({
+        "undo": e.undo.iter().map(|h| h.label.as_str()).collect::<Vec<_>>(),
+        "redo": e.redo.iter().rev().map(|h| h.label.as_str()).collect::<Vec<_>>(),
+    })
+}
+
+/// 重算峰值/响度并出 JSON（任何改了 `buf` 的命令收尾用）
+fn refresh(id: &str, e: &mut DocEntry) -> Value {
+    let (peaks, stats) = peaks_and_stats(&e.buf);
+    e.peaks = peaks;
+    entry_json(id, e, stats)
+}
+
+/// 提交一次编辑：旧音频入 undo 栈、清空 redo、换上新音频
+fn commit(id: &str, e: &mut DocEntry, label: impl Into<String>, new_buf: AudioBuffer) -> Value {
+    let old = std::mem::replace(&mut e.buf, Arc::new(new_buf));
+    e.undo.push(HistItem { label: label.into(), buf: old });
+    e.redo.clear();
+    let mut total: usize = e.undo.iter().map(|h| h.buf.samples.len()).sum();
+    while e.undo.len() > 1 && (e.undo.len() > HISTORY_MAX_STEPS || total > HISTORY_MAX_SAMPLES) {
+        total -= e.undo.remove(0).buf.samples.len();
+    }
+    refresh(id, e)
+}
+
+/// 区间参数 begin/end（帧），钳到文档内且非空
+fn span_of(p: &Value, frames: usize) -> Result<(usize, usize), String> {
+    let end = (as_u64(p, "end", frames as u64) as usize).min(frames);
+    let begin = (as_u64(p, "begin", 0) as usize).min(end);
+    if begin >= end {
+        return Err("选区为空".into());
+    }
+    Ok((begin, end))
+}
+
+fn fmt_secs(frames: usize, rate: u32) -> String {
+    format!("{:.3}s", frames as f64 / rate.max(1) as f64)
+}
+
+fn clip_json(c: &Option<Arc<AudioBuffer>>) -> Value {
+    match c {
+        Some(b) => json!({
+            "frames": b.frames(),
+            "sampleRate": b.sample_rate,
+            "channels": b.channels,
+            "durationSec": b.duration_secs(),
+        }),
+        None => Value::Null,
+    }
+}
+
+/// 剪切：区间进剪贴板，并从文档删掉
+fn doc_cut(docs: &mut Docs, p: &Value) -> Result<Value, String> {
+    let id = doc_id_of(p);
+    let e = docs.get_mut(&id)?;
+    let (b, end) = span_of(p, e.buf.frames())?;
+    if b == 0 && end == e.buf.frames() {
+        return Err("不能剪掉全部音频（可用「静音」）".into());
+    }
+    let ch = e.buf.channels.max(1);
+    let (sr, chn) = (e.buf.sample_rate, e.buf.channels);
+    let clip = e.buf.samples[b * ch..end * ch].to_vec();
+    let mut rest = Vec::with_capacity(e.buf.samples.len() - clip.len());
+    rest.extend_from_slice(&e.buf.samples[..b * ch]);
+    rest.extend_from_slice(&e.buf.samples[end * ch..]);
+    let label = format!("剪切 {}", fmt_secs(end - b, sr));
+    let resp = commit(&id, e, label, AudioBuffer { sample_rate: sr, channels: chn, samples: rest });
+    docs.clipboard = Some(Arc::new(AudioBuffer { sample_rate: sr, channels: chn, samples: clip }));
+    Ok(resp)
+}
+
+/// 复制：区间进剪贴板（文档不变）
+fn doc_copy(docs: &mut Docs, p: &Value) -> Result<Value, String> {
+    let id = doc_id_of(p);
+    let e = docs.get(&id)?;
+    let (b, end) = span_of(p, e.buf.frames())?;
+    let ch = e.buf.channels.max(1);
+    let clip = AudioBuffer {
+        sample_rate: e.buf.sample_rate,
+        channels: e.buf.channels,
+        samples: e.buf.samples[b * ch..end * ch].to_vec(),
+    };
+    docs.clipboard = Some(Arc::new(clip));
+    Ok(clip_json(&docs.clipboard))
+}
+
+/// 粘贴剪贴板：有 begin<end 则替换该区间，否则插入到 frame。
+/// 采样率 / 声道与目标文档不一致时自动转换。
+fn doc_paste_clip(docs: &mut Docs, p: &Value) -> Result<Value, String> {
+    let id = doc_id_of(p);
+    let clip = docs.clipboard.clone().ok_or_else(|| "剪贴板为空".to_string())?;
+    let e = docs.get_mut(&id)?;
+    let frames = e.buf.frames();
+    let ch = e.buf.channels.max(1);
+    let mut clip: AudioBuffer = (*clip).clone();
+    if clip.channels != e.buf.channels {
+        clip = crate::transform::convert_channels(&clip, e.buf.channels);
+    }
+    if clip.sample_rate != e.buf.sample_rate {
+        clip = crate::transform::resample(&clip, e.buf.sample_rate);
+    }
+    let (b, end) = match span_of(p, frames) {
+        Ok(r) if p.get("begin").is_some() => r,
+        _ => {
+            let at = (as_u64(p, "frame", 0) as usize).min(frames);
+            (at, at)
+        }
+    };
+    let mut out = Vec::with_capacity(e.buf.samples.len() - (end - b) * ch + clip.samples.len());
+    out.extend_from_slice(&e.buf.samples[..b * ch]);
+    out.extend_from_slice(&clip.samples);
+    out.extend_from_slice(&e.buf.samples[end * ch..]);
+    let label = if end > b {
+        format!("粘贴（替换 {}）", fmt_secs(end - b, e.buf.sample_rate))
+    } else {
+        format!("粘贴 {}", fmt_secs(clip.frames(), e.buf.sample_rate))
+    };
+    let (sr, chn) = (e.buf.sample_rate, e.buf.channels);
+    Ok(commit(&id, e, label, AudioBuffer { sample_rate: sr, channels: chn, samples: out }))
+}
+
+/// 静音：区间置 0
+fn doc_silence(docs: &mut Docs, p: &Value) -> Result<Value, String> {
+    let id = doc_id_of(p);
+    let e = docs.get_mut(&id)?;
+    let (b, end) = span_of(p, e.buf.frames())?;
+    let ch = e.buf.channels.max(1);
+    let mut out = (*e.buf).clone();
+    out.samples[b * ch..end * ch].fill(0.0);
+    let label = format!("静音 {}", fmt_secs(end - b, out.sample_rate));
+    Ok(commit(&id, e, label, out))
+}
+
+/// 淡入 / 淡出：区间内线性增益 0→1（dir="in"）或 1→0（dir="out"）
+fn doc_fade(docs: &mut Docs, p: &Value) -> Result<Value, String> {
+    let id = doc_id_of(p);
+    let fade_in = match p.get("dir").and_then(|x| x.as_str()) {
+        Some("in") => true,
+        Some("out") => false,
+        _ => return Err("dir 需为 in 或 out".into()),
+    };
+    let e = docs.get_mut(&id)?;
+    let (b, end) = span_of(p, e.buf.frames())?;
+    let ch = e.buf.channels.max(1);
+    let mut out = (*e.buf).clone();
+    let n = end - b;
+    let denom = (n.max(2) - 1) as f32;
+    for k in 0..n {
+        let x = k as f32 / denom; // 0..=1
+        let g = if fade_in { x } else { 1.0 - x };
+        for v in &mut out.samples[(b + k) * ch..(b + k + 1) * ch] {
+            *v *= g;
+        }
+    }
+    let label = format!("{} {}", if fade_in { "淡入" } else { "淡出" }, fmt_secs(n, out.sample_rate));
+    Ok(commit(&id, e, label, out))
+}
+
+/// 撤销 steps 步（默认 1）
+fn doc_undo(docs: &mut Docs, p: &Value) -> Result<Value, String> {
+    let id = doc_id_of(p);
+    let e = docs.get_mut(&id)?;
+    let steps = as_u64(p, "steps", 1).max(1) as usize;
+    if e.undo.is_empty() {
+        return Err("没有可撤销的操作".into());
+    }
+    for _ in 0..steps {
+        let Some(h) = e.undo.pop() else { break };
+        let cur = std::mem::replace(&mut e.buf, h.buf);
+        e.redo.push(HistItem { label: h.label, buf: cur });
+    }
+    Ok(refresh(&id, e))
+}
+
+/// 重做 steps 步（默认 1）
+fn doc_redo(docs: &mut Docs, p: &Value) -> Result<Value, String> {
+    let id = doc_id_of(p);
+    let e = docs.get_mut(&id)?;
+    let steps = as_u64(p, "steps", 1).max(1) as usize;
+    if e.redo.is_empty() {
+        return Err("没有可重做的操作".into());
+    }
+    for _ in 0..steps {
+        let Some(h) = e.redo.pop() else { break };
+        let cur = std::mem::replace(&mut e.buf, h.buf);
+        e.undo.push(HistItem { label: h.label, buf: cur });
+    }
+    Ok(refresh(&id, e))
 }
 
 fn as_u64(v: &Value, key: &str, default: u64) -> u64 {
@@ -137,6 +347,13 @@ pub fn dispatch_write(docs: &mut Docs, cmd: &str, p: &Value) -> Result<Value, St
         "doc_rename" => doc_rename(docs, p),
         "doc_save" => doc_save(docs, p),
         "doc_paste" => doc_paste(docs, p),
+        "doc_cut" => doc_cut(docs, p),
+        "doc_copy" => doc_copy(docs, p),
+        "doc_paste_clip" => doc_paste_clip(docs, p),
+        "doc_silence" => doc_silence(docs, p),
+        "doc_fade" => doc_fade(docs, p),
+        "doc_undo" => doc_undo(docs, p),
+        "doc_redo" => doc_redo(docs, p),
         other => Err(format!("unknown cmd: {other}")),
     }
 }
@@ -150,6 +367,8 @@ pub fn dispatch_read(docs: &Docs, cmd: &str, p: &Value) -> Result<Value, String>
         "doc_info" => doc_info(docs, p),
         "encoder_caps" => Ok(crate::encode::capabilities()),
         "pcm" => pcm(docs, p),
+        "clipboard_info" => Ok(clip_json(&docs.clipboard)),
+        "mss_constellation" => mss_constellation(docs, p),
         other => Err(format!("unknown cmd: {other}")),
     }
 }
@@ -169,6 +388,8 @@ fn build_doc_entry(
         buf,
         peaks,
         meta,
+        undo: Vec::new(),
+        redo: Vec::new(),
     };
     let resp = entry_json(&doc_id, &entry, stats);
     (resp, entry)
@@ -336,11 +557,8 @@ fn doc_resample(docs: &mut Docs, p: &Value) -> Result<Value, String> {
     if entry.buf.sample_rate == rate {
         return Err(format!("当前已是 {rate} Hz，无需转换"));
     }
-    let new_buf = Arc::new(crate::transform::resample(&entry.buf, rate));
-    let (peaks, stats) = peaks_and_stats(&new_buf);
-    entry.buf = new_buf;
-    entry.peaks = peaks;
-    Ok(entry_json(&id, entry, stats))
+    let new_buf = crate::transform::resample(&entry.buf, rate);
+    Ok(commit(&id, entry, format!("转换采样率 → {rate} Hz"), new_buf))
 }
 
 /// 转换声道布局：1 = 下混为单声道，2 = 上混为立体声。
@@ -358,11 +576,8 @@ fn doc_channels(docs: &mut Docs, p: &Value) -> Result<Value, String> {
     if entry.buf.channels == target {
         return Err(format!("当前已是{}", channels_text(target)));
     }
-    let new_buf = Arc::new(crate::transform::convert_channels(&entry.buf, target));
-    let (peaks, stats) = peaks_and_stats(&new_buf);
-    entry.buf = new_buf;
-    entry.peaks = peaks;
-    Ok(entry_json(&id, entry, stats))
+    let new_buf = crate::transform::convert_channels(&entry.buf, target);
+    Ok(commit(&id, entry, format!("转换为{}", channels_text(target)), new_buf))
 }
 
 /// 「粘贴 PCM」—— 在文档指定帧位置插入 f32le base64 数据。
@@ -404,15 +619,13 @@ fn doc_paste(docs: &mut Docs, p: &Value) -> Result<Value, String> {
     };
 
     samples.splice(at..at, adapted.iter().copied());
-    let new_buf = Arc::new(AudioBuffer {
+    let new_buf = AudioBuffer {
         sample_rate: entry.buf.sample_rate,
         channels: entry.buf.channels,
         samples,
-    });
-    let (peaks, stats) = peaks_and_stats(&new_buf);
-    entry.buf = new_buf;
-    entry.peaks = peaks;
-    Ok(entry_json(&id, entry, stats))
+    };
+    let label = format!("插入录音 {}", fmt_secs(adapted.len() / ch, new_buf.sample_rate));
+    Ok(commit(&id, entry, label, new_buf))
 }
 
 // ---------- 文件操作：重命名 / 保存 / 另存为 / 导出 ----------
@@ -560,15 +773,19 @@ fn doc_save(docs: &mut Docs, p: &Value) -> Result<Value, String> {
 /// 返回 data = 逐声道顺次拼接的 [min, max] 平铺数组。
 fn waveform_cmd(docs: &Docs, p: &Value) -> Result<Value, String> {
     let doc = docs.get(p.get("docId").and_then(|x| x.as_str()).unwrap_or(""))?;
-    let buckets = (as_u64(p, "buckets", 2000) as usize).clamp(64, 16384);
     let ch = doc.buf.channels.max(1);
     let frames = doc.buf.frames();
-    let seg = frames.div_ceil(buckets).max(1);
+    // 可选区间 [begin, end)（帧）—— 缩放视图只取可见窗口
+    let end = (as_u64(p, "end", frames as u64) as usize).min(frames);
+    let begin = (as_u64(p, "begin", 0) as usize).min(end);
+    let n = end - begin;
+    // 桶数不超过区间帧数（否则多出来的桶是空的）；边界按比例切分，不留尾部空桶
+    let buckets = (as_u64(p, "buckets", 2000) as usize).clamp(1, 16384).min(n.max(1));
     let mut data = Vec::with_capacity(ch * buckets * 2);
     for c in 0..ch {
         for b in 0..buckets {
-            let f0 = (b * seg).min(frames);
-            let f1 = (((b + 1) * seg).min(frames)).max(f0);
+            let f0 = begin + b * n / buckets;
+            let f1 = (begin + (b + 1) * n / buckets).max(f0 + 1).min(end);
             let (mut mn, mut mx) = (f32::INFINITY, f32::NEG_INFINITY);
             let mut i = f0 * ch + c;
             let stop = f1 * ch;
@@ -588,6 +805,8 @@ fn waveform_cmd(docs: &Docs, p: &Value) -> Result<Value, String> {
     Ok(json!({
         "channels": ch,
         "buckets": buckets,
+        "begin": begin,
+        "end": end,
         "data": data,
     }))
 }
@@ -692,5 +911,39 @@ fn pcm(docs: &Docs, p: &Value) -> Result<Value, String> {
         "begin": begin,
         "frames": end - begin,
         "f32leBase64": base64::engine::general_purpose::STANDARD.encode(bytes),
+    }))
+}
+
+/// 「波形和星座图」：rust_mss emd-core 0.3.0 default profile 指纹（fast peaks + 查询哈希上限）。
+/// 峰 / 哈希用平铺数组：peaks = [t, f, dB, ...]，hashes = [t, f1, f2, dt, ...]；
+/// f 为频带内下标（绝对 bin = f + binLo），帧 t 的中心 = t * hop / sampleRate 秒。
+fn mss_constellation(docs: &Docs, p: &Value) -> Result<Value, String> {
+    use crate::mss;
+    let doc = docs.get(&doc_id_of(p))?;
+    let y = mss::to_8k_mono(&doc.buf);
+    let fp = mss::fingerprint(&y);
+    let mut peaks = Vec::with_capacity(fp.peaks.len() * 3);
+    for pk in &fp.peaks {
+        peaks.push(pk.t as f64);
+        peaks.push(pk.f as f64);
+        peaks.push((pk.db() as f64 * 100.0).round() / 100.0);
+    }
+    let mut hashes = Vec::with_capacity(fp.hashes.len() * 4);
+    for h in &fp.hashes {
+        hashes.extend_from_slice(&[h.t, h.f1 as u32, h.f2 as u32, h.dt as u32]);
+    }
+    Ok(json!({
+        "algorithm": "rust_mss emd-core 0.3.0 default",
+        "params": "fft=512,win=480,hop=80,lo=4,hi=144,ff=6,ft=7,thr=-6.25,zone=20,f2lo=1,f2hi=90; fast-peaks on; hash-cap 1500/s:20",
+        "sampleRate": mss::SAMPLE_RATE,
+        "hop": mss::HOP,
+        "nFft": mss::N_FFT,
+        "binLo": mss::BIN_LO,
+        "binHi": mss::BIN_HI,
+        "frames": fp.frames,
+        "peaks": peaks,
+        "hashes": hashes,
+        "peaksUncapped": fp.peaks_uncapped,
+        "hashesUncapped": fp.hashes_uncapped,
     }))
 }

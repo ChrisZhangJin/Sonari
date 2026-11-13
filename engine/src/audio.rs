@@ -148,6 +148,19 @@ fn playback_start(st: &AudioState, docs: &Docs, p: &Value) -> Result<Value, Stri
     if end == begin {
         return Err("播放区间为空".into());
     }
+    // 可选：只播放这些源声道（其余静音）；缺省 = 全部
+    let gains: Arc<[f32]> = match p.get("channels").and_then(|x| x.as_array()) {
+        Some(list) => {
+            let mut g = vec![0.0f32; src_ch];
+            for c in list.iter().filter_map(|x| x.as_u64()) {
+                if (c as usize) < src_ch {
+                    g[c as usize] = 1.0;
+                }
+            }
+            g.into()
+        }
+        None => vec![1.0f32; src_ch].into(),
+    };
 
     // 若已有播放流，先停掉
     *st.playback.lock().unwrap() = None;
@@ -180,6 +193,7 @@ fn playback_start(st: &AudioState, docs: &Docs, p: &Value) -> Result<Value, Stri
         dev_sr,
         buf.clone(),
         src_ch,
+        gains.clone(),
         begin,
         span,
         ratio,
@@ -195,6 +209,7 @@ fn playback_start(st: &AudioState, docs: &Docs, p: &Value) -> Result<Value, Stri
             dev_sr,
             buf.clone(),
             src_ch,
+            gains.clone(),
             begin,
             span,
             ratio,
@@ -211,6 +226,7 @@ fn playback_start(st: &AudioState, docs: &Docs, p: &Value) -> Result<Value, Stri
             dev_sr,
             buf.clone(),
             src_ch,
+            gains.clone(),
             begin,
             span,
             ratio,
@@ -251,6 +267,7 @@ fn build_out<T: SizedSample + 'static>(
     dev_sr: u32,
     src: Arc<AudioBuffer>,
     src_ch: usize,
+    gains: Arc<[f32]>,
     begin: usize,
     span: usize,
     ratio: f64,
@@ -281,7 +298,7 @@ fn build_out<T: SizedSample + 'static>(
                         let sc = c.min(src_ch - 1);
                         let a = sample_at(&src, f0, sc, src_ch);
                         let b = sample_at(&src, f1, sc, src_ch);
-                        out[k * dev_ch + c] = cvt(a + (b - a) * frac);
+                        out[k * dev_ch + c] = cvt((a + (b - a) * frac) * gains[sc]);
                     }
                     cursor += ratio;
                 }

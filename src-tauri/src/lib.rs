@@ -4,6 +4,8 @@
 //! 对标 ocenaudio：libqtocen（Qt 表现层宿主）。播放/录音走引擎 cpal
 //! （`audio_*` 命令，真实设备选择），其余命令走 `commands` 命令总线。
 
+mod dialogs;
+
 use std::sync::{Arc, RwLock};
 
 use sonari_engine::audio::{self, AudioState};
@@ -44,7 +46,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState::default())
-        .invoke_handler(tauri::generate_handler![engine])
+        .invoke_handler(tauri::generate_handler![engine, dialogs::file_dialog])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

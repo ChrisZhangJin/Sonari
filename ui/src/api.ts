@@ -51,6 +51,33 @@ export interface DocOpened {
   /** 4096 bucket × [min,max] 展平 */
   peaks: number[];
   stats: LevelStats | null;
+  /** 操作历史：undo 从旧到新；redo 从「下一个可重做」开始 */
+  history?: { undo: string[]; redo: string[] };
+}
+
+/** 「波形和星座图」数据：peaks = [t, f, dB, ...]，hashes = [t, f1, f2, dt, ...]；
+ *  f 为频带内下标（绝对 bin = f + binLo），帧 t 中心 = t*hop/sampleRate 秒 */
+export interface MssConstellation {
+  algorithm: string;
+  params: string;
+  sampleRate: number;
+  hop: number;
+  nFft: number;
+  binLo: number;
+  binHi: number;
+  frames: number;
+  peaks: number[];
+  hashes: number[];
+  peaksUncapped: number;
+  hashesUncapped: number;
+}
+
+/** 剪贴板中的音频（剪切 / 复制产物） */
+export interface ClipInfo {
+  frames: number;
+  sampleRate: number;
+  channels: number;
+  durationSec: number;
 }
 
 /** 编码器能力（ffmpeg 是否可用 / 支持哪些格式） */
@@ -100,6 +127,18 @@ export interface ConstellationResult {
   frames_analyzed: number;
 }
 
+/** 系统文件对话框（宿主命令 file_dialog；Linux 走原生 GTK，见 src-tauri/src/dialogs.rs） */
+export function fileDialog(opts: {
+  mode: 'open' | 'save';
+  title?: string;
+  defaultPath?: string;
+  filters?: { name: string; extensions: string[] }[];
+}): Promise<string | null> {
+  return invoke<string | null>('file_dialog', { opts }).catch((e: unknown) => {
+    throw new Error(errText(e));
+  });
+}
+
 export class Engine {
   private call<T>(cmd: string, params: Record<string, unknown> = {}): Promise<T> {
     return invoke<T>('engine', {
@@ -117,8 +156,9 @@ export class Engine {
   waveform(
     docId: string,
     buckets = 2000,
+    range?: { begin: number; end: number },
   ): Promise<{ channels: number; buckets: number; data: number[] }> {
-    return this.call('waveform', { docId, buckets });
+    return this.call('waveform', { docId, buckets, ...range });
   }
   docClose(docId: string): Promise<void> {
     return this.call('doc_close', { docId });
@@ -200,6 +240,38 @@ export class Engine {
     return this.call('doc_paste', { docId, frame, f32leBase64 });
   }
 
+  // ---- 编辑 + 历史（区间单位：帧） ----
+  docCut(docId: string, begin: number, end: number): Promise<DocOpened> {
+    return this.call('doc_cut', { docId, begin, end });
+  }
+  docCopy(docId: string, begin: number, end: number): Promise<ClipInfo> {
+    return this.call('doc_copy', { docId, begin, end });
+  }
+  /** 粘贴剪贴板：给 begin/end 则替换该区间，否则插入到 frame */
+  docPasteClip(docId: string, at: { frame: number } | { begin: number; end: number }): Promise<DocOpened> {
+    return this.call('doc_paste_clip', { docId, ...at });
+  }
+  docSilence(docId: string, begin: number, end: number): Promise<DocOpened> {
+    return this.call('doc_silence', { docId, begin, end });
+  }
+  /** 淡入 / 淡出（区间内线性增益） */
+  docFade(docId: string, begin: number, end: number, dir: 'in' | 'out'): Promise<DocOpened> {
+    return this.call('doc_fade', { docId, begin, end, dir });
+  }
+  /** rust_mss emd-core 0.3.0 default 指纹（fast peaks + 哈希上限） */
+  mssConstellation(docId: string): Promise<MssConstellation> {
+    return this.call('mss_constellation', { docId });
+  }
+  docUndo(docId: string, steps = 1): Promise<DocOpened> {
+    return this.call('doc_undo', { docId, steps });
+  }
+  docRedo(docId: string, steps = 1): Promise<DocOpened> {
+    return this.call('doc_redo', { docId, steps });
+  }
+  clipboardInfo(): Promise<ClipInfo | null> {
+    return this.call('clipboard_info', {});
+  }
+
   // ---- 音频设备（cpal） ----
   audioDevices(): Promise<{
     host: string;
@@ -208,8 +280,15 @@ export class Engine {
   }> {
     return this.call('audio_devices', {});
   }
-  playbackStart(docId: string, begin: number, end: number, device?: string): Promise<unknown> {
-    return this.call('playback_start', { docId, begin, end, device: device ?? '' });
+  /** channels：只播放这些源声道（其余静音）；缺省 = 全部 */
+  playbackStart(
+    docId: string,
+    begin: number,
+    end: number,
+    device?: string,
+    channels?: number[],
+  ): Promise<unknown> {
+    return this.call('playback_start', { docId, begin, end, device: device ?? '', ...(channels ? { channels } : {}) });
   }
   playbackStop(): Promise<unknown> {
     return this.call('playback_stop', {});
