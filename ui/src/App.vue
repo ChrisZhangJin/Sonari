@@ -689,23 +689,50 @@ async function drawConst() {
 
 // ---- 「波形和星座图」：rust_mss emd-core 0.3.0 default 指纹 ----
 const mssCanvas = ref<HTMLCanvasElement | null>(null);
-/** 按文档对象缓存：每次编辑 / 撤销都会换成新的文档对象，缓存自然失效 */
-const mssCache = new WeakMap<DocOpened, MssConstellation>();
+/** 按文档对象缓存：每次编辑 / 撤销都会换成新的文档对象，缓存自然失效。
+ *  键 = 时间窗（秒），长文件按窗口分块计算。 */
+const mssCache = new WeakMap<DocOpened, Map<string, MssConstellation>>();
+/** 引擎单次指纹计算的时间窗上限（秒），与后端 MAX_SECONDS 对齐 */
+const MSS_MAX_WINDOW = 600;
+/** 窗口量化粒度（秒）—— 同一窗口内复用缓存，避免平移时反复重算 */
+const MSS_WINDOW_STEP = 30;
 async function drawMss(gen: number) {
   const c = mssCanvas.value;
   const d = activeDoc.value;
   if (!c || !d) return;
-  let r = mssCache.get(d);
+  // 短文件：整段一次算完（缓存键 = "all"）
+  // 长文件：按量化窗口分块算，避免后端 O(全长) 的重采样+STFT 打爆内存
+  const dur = d.info.durationSec;
+  const whole = dur <= MSS_MAX_WINDOW;
+  let wb = 0;
+  let we = dur;
+  let key = 'all';
+  if (!whole) {
+    const { a, b } = win();
+    wb = Math.max(0, Math.floor(a / MSS_WINDOW_STEP) * MSS_WINDOW_STEP);
+    we = Math.min(dur, Math.ceil(b / MSS_WINDOW_STEP) * MSS_WINDOW_STEP);
+    if (we - wb > MSS_MAX_WINDOW) we = wb + MSS_MAX_WINDOW;
+    key = `${wb.toFixed(1)}-${we.toFixed(1)}`;
+  }
+  let buckets = mssCache.get(d);
+  if (!buckets) {
+    buckets = new Map<string, MssConstellation>();
+    mssCache.set(d, buckets);
+  }
+  let r = buckets.get(key);
   if (!r) {
     try {
-      r = await eng.mssConstellation(d.docId);
+      r = whole
+        ? await eng.mssConstellation(d.docId)
+        : await eng.mssConstellation(d.docId, wb, we);
     } catch (e: any) {
       status.value = `星座图失败: ${errText(e)}`;
       return;
     }
-    mssCache.set(d, r);
+    buckets.set(key, r);
     if (gen !== redrawGen) return;
   }
+  const base = r.beginSec ?? 0; // 指纹的帧 0 对应的绝对秒数
   fitCanvas(c);
   const g = c.getContext('2d')!;
   const W = c.width;
@@ -716,10 +743,11 @@ async function drawMss(gen: number) {
   const span = Math.max(b - a, 1e-9);
   const sec = r.hop / r.sampleRate; // 每帧秒数
   const nb = r.binHi - r.binLo;
-  const xOf = (t: number) => ((t * sec - a) / span) * W;
+  // 帧号 t 是相对指纹窗口起点的，需加 base 换算成绝对秒
+  const xOf = (t: number) => ((base + t * sec - a) / span) * W;
   const yOf = (f: number) => H - 4 - ((f + 0.5) / nb) * (H - 8);
-  const t0 = Math.floor(a / sec) - 21;
-  const t1 = Math.ceil(b / sec) + 1;
+  const t0 = Math.floor((a - base) / sec) - 21;
+  const t1 = Math.ceil((b - base) / sec) + 1;
   // 频率刻度
   g.font = '10px Consolas, monospace';
   g.textAlign = 'right';
@@ -764,8 +792,10 @@ async function drawMss(gen: number) {
   g.textAlign = 'left';
   g.fillStyle = 'rgba(220,230,240,0.85)';
   const capped = r.hashesUncapped > H4.length / 4 ? `（上限前 ${r.hashesUncapped}）` : '';
+  const trunc = r.hashesTruncated || r.peaksTruncated ? ' · 载荷已截断' : '';
+  const winTxt = base > 0 ? ` · 窗口 ${base.toFixed(0)}–${(base + (r.frames * sec)).toFixed(0)}s` : '';
   g.fillText(
-    `rust_mss 0.3.0 default · fast peaks · 峰 ${P.length / 3} · 哈希 ${H4.length / 4}${capped}` +
+    `rust_mss 0.3.0 default · fast peaks · 峰 ${P.length / 3} · 哈希 ${H4.length / 4}${capped}${trunc}${winTxt}` +
       (inWin > 30000 ? ` · 窗口内 ${inWin} 条连线过多未画，放大查看` : ''),
     6,
     12,

@@ -241,7 +241,10 @@ fn doc_paste_clip(docs: &mut Docs, p: &Value) -> Result<Value, String> {
             (at, at)
         }
     };
-    let mut out = Vec::with_capacity(e.buf.samples.len() - (end - b) * ch + clip.samples.len());
+    // 容量按「原长 - 替换区 + 剪贴板长」估算；用 saturating_sub 防止下溢
+    let replaced = (end - b).saturating_mul(ch);
+    let cap = e.buf.samples.len().saturating_sub(replaced) + clip.samples.len();
+    let mut out = Vec::with_capacity(cap);
     out.extend_from_slice(&e.buf.samples[..b * ch]);
     out.extend_from_slice(&clip.samples);
     out.extend_from_slice(&e.buf.samples[end * ch..]);
@@ -920,16 +923,47 @@ fn pcm(docs: &Docs, p: &Value) -> Result<Value, String> {
 fn mss_constellation(docs: &Docs, p: &Value) -> Result<Value, String> {
     use crate::mss;
     let doc = docs.get(&doc_id_of(p))?;
-    let y = mss::to_8k_mono(&doc.buf);
+    // 指纹计算是 O(全长 × FFT)：整段重采样 + STFT，长文件会耗尽内存/时间。
+    // 只对「请求的时间窗」计算，并设硬上限。
+    const MAX_SECONDS: f64 = 600.0; // 10 分钟
+    let dur = doc.buf.duration_secs();
+    let begin = as_f64(p, "begin", 0.0).max(0.0);
+    let end = as_f64(p, "end", dur).min(dur);
+    if !(end > begin) {
+        return Err("时间范围为空".into());
+    }
+    if end - begin > MAX_SECONDS {
+        return Err(format!(
+            "时间窗过长（{:.0}s > 上限 {:.0}s），请缩小范围",
+            end - begin,
+            MAX_SECONDS
+        ));
+    }
+    // 裁剪到窗口（按帧对齐）
+    let sr = doc.buf.sample_rate.max(1);
+    let ch = doc.buf.channels.max(1);
+    let b = ((begin * sr as f64) as usize).min(doc.buf.samples.len());
+    let e = ((end * sr as f64) as usize).min(doc.buf.samples.len());
+    let clipped = AudioBuffer {
+        sample_rate: doc.buf.sample_rate,
+        channels: ch,
+        samples: doc.buf.samples[b..e].to_vec(),
+    };
+    let y = mss::to_8k_mono(&clipped);
     let fp = mss::fingerprint(&y);
-    let mut peaks = Vec::with_capacity(fp.peaks.len() * 3);
-    for pk in &fp.peaks {
+    // 载荷上限：避免百万级数组跨 IPC 传输（前端只画可视窗口内的点）
+    const MAX_PEAKS: usize = 200_000;
+    const MAX_HASHES: usize = 200_000;
+    let peak_iter = fp.peaks.iter().take(MAX_PEAKS);
+    let mut peaks = Vec::with_capacity(peak_iter.size_hint().0 * 3);
+    for pk in peak_iter {
         peaks.push(pk.t as f64);
         peaks.push(pk.f as f64);
         peaks.push((pk.db() as f64 * 100.0).round() / 100.0);
     }
-    let mut hashes = Vec::with_capacity(fp.hashes.len() * 4);
-    for h in &fp.hashes {
+    let hash_iter = fp.hashes.iter().take(MAX_HASHES);
+    let mut hashes = Vec::with_capacity(hash_iter.size_hint().0 * 4);
+    for h in hash_iter {
         hashes.extend_from_slice(&[h.t, h.f1 as u32, h.f2 as u32, h.dt as u32]);
     }
     Ok(json!({
@@ -945,5 +979,9 @@ fn mss_constellation(docs: &Docs, p: &Value) -> Result<Value, String> {
         "hashes": hashes,
         "peaksUncapped": fp.peaks_uncapped,
         "hashesUncapped": fp.hashes_uncapped,
+        "peaksTruncated": fp.peaks.len() > MAX_PEAKS,
+        "hashesTruncated": fp.hashes.len() > MAX_HASHES,
+        "beginSec": begin,
+        "endSec": end,
     }))
 }

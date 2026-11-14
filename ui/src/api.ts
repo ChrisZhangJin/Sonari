@@ -70,6 +70,12 @@ export interface MssConstellation {
   hashes: number[];
   peaksUncapped: number;
   hashesUncapped: number;
+  /** 载荷被上限截断（前端应提示） */
+  peaksTruncated?: boolean;
+  hashesTruncated?: boolean;
+  /** 本次计算覆盖的时间窗（秒） */
+  beginSec?: number;
+  endSec?: number;
 }
 
 /** 剪贴板中的音频（剪切 / 复制产物） */
@@ -259,8 +265,8 @@ export class Engine {
     return this.call('doc_fade', { docId, begin, end, dir });
   }
   /** rust_mss emd-core 0.3.0 default 指纹（fast peaks + 哈希上限） */
-  mssConstellation(docId: string): Promise<MssConstellation> {
-    return this.call('mss_constellation', { docId });
+  mssConstellation(docId: string, begin?: number, end?: number): Promise<MssConstellation> {
+    return this.call('mss_constellation', { docId, begin, end });
   }
   docUndo(docId: string, steps = 1): Promise<DocOpened> {
     return this.call('doc_undo', { docId, steps });
