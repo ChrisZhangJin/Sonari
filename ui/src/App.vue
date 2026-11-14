@@ -3,7 +3,10 @@ import { ref, computed, watch, nextTick, onMounted, onUnmounted } from 'vue';
 import {
   Engine,
   errText,
+  fileDialog,
   type DocOpened,
+  type ClipInfo,
+  type MssConstellation,
   type ConstellationResult,
   type DocDetail,
   type EncoderCaps,
@@ -38,7 +41,7 @@ const closeConfirmDocId = ref('');
 const closeConfirmDoc = computed(() => docs.value.find((d) => d.docId === closeConfirmDocId.value) ?? null);
 
 // ---- 视图 ----
-type ViewMode = 'wave' | 'spec' | 'both' | 'const';
+type ViewMode = 'wave' | 'spec' | 'both' | 'const' | 'waveconst';
 const view = ref<ViewMode>('both');
 
 // ---- 菜单 ----
@@ -46,6 +49,14 @@ const openMenu = ref<'' | 'file' | 'edit' | 'view'>('');
 function toggleMenu(m: 'file' | 'edit' | 'view') {
   openMenu.value = openMenu.value === m ? '' : m;
 }
+/** 下拉菜单项点击后收起菜单（并阻止冒泡到标题再把菜单切回打开）；
+ *  点在带子菜单的父项本身上则保持打开 */
+function onDropdownClick(e: MouseEvent) {
+  const mi = (e.target as HTMLElement).closest('.mi');
+  if (mi && mi.classList.contains('has-sub') && !(e.target as HTMLElement).closest('.submenu')) return;
+  openMenu.value = '';
+}
+
 function setView(v: ViewMode) {
   view.value = v;
   openMenu.value = '';
@@ -62,7 +73,31 @@ const specHop = ref(256);
 
 // ---- 数据缓存 ----
 const waveCache = new Map<string, number[][]>(); // docId -> number[][]（每声道平铺 [min,max]）
-const specCache = new Map<string, number[][]>(); // docId:ch -> frames[][]
+type SpecData = { frames: number[][]; hop: number; begin: number; fft: number };
+const specCache = new Map<string, SpecData>(); // docId:ch -> 全文件频谱
+const zoomSpecCache = new Map<string, SpecData>(); // docId:ch:begin:end:hop -> 缩放窗口频谱（小 LRU）
+const SPEC_FFT = 1024;
+
+// ---- 缩放视图：可见时间窗 [viewA, viewB]（秒）；viewB <= viewA 表示整段 ----
+const viewA = ref(0);
+const viewB = ref(0);
+/** 当前可见窗口（秒），始终落在 [0, dur] 内 */
+function win(): { a: number; b: number } {
+  const dur = activeDoc.value?.info.durationSec ?? 0;
+  if (viewB.value > viewA.value && viewA.value >= 0 && viewB.value <= dur + 1e-9) {
+    return { a: viewA.value, b: viewB.value };
+  }
+  return { a: 0, b: dur };
+}
+const zoomed = computed(() => {
+  const dur = activeDoc.value?.info.durationSec ?? 0;
+  const { a, b } = win();
+  return dur > 0 && b - a < dur - 1e-9;
+});
+function resetView() {
+  viewA.value = 0;
+  viewB.value = 0;
+}
 
 // ---- 画布引用 ----
 const waveCanvases: (HTMLCanvasElement | null)[] = [];
@@ -134,22 +169,24 @@ function baseName(p: string): string {
 // ---- 文件打开：桌面走系统文件管理器，浏览器退回输入 ----
 const AUDIO_EXTS = ['wav', 'mp3', 'flac', 'ogg', 'opus', 'm4a', 'aac', 'aif', 'aiff', 'wma'];
 async function openFileDialog(): Promise<string | null> {
-  const { open } = await import('@tauri-apps/plugin-dialog');
-  const sel = await open({
-    multiple: false,
+  return fileDialog({
+    mode: 'open',
     title: '打开音频文件',
     filters: [
       { name: '音频文件', extensions: AUDIO_EXTS },
       { name: '所有文件', extensions: ['*'] },
     ],
   });
-  return typeof sel === 'string' ? sel : null;
 }
 
 async function triggerOpen() {
   openMenu.value = '';
-  const path = await openFileDialog();
-  if (path) await openPath(path);
+  try {
+    const path = await openFileDialog();
+    if (path) await openPath(path);
+  } catch (e: any) {
+    status.value = `打开对话框失败: ${errText(e)}`;
+  }
 }
 
 async function openPath(path: string) {
@@ -209,6 +246,7 @@ async function doCloseDoc(docId: string) {
   waveCache.delete(docId);
   dirtyDocs.value.delete(docId);
   for (const k of [...specCache.keys()]) if (k.startsWith(docId + ':')) specCache.delete(k);
+  zoomSpecCache.clear();
   if (activeId.value === docId) activeId.value = docs.value.at(-1)?.docId ?? '';
 }
 
@@ -292,6 +330,19 @@ function loadAudioPrefs(): { output: string; input: string } {
 }
 watch(audioPrefs, (v) => localStorage.setItem(AUDIO_PREFS_KEY, JSON.stringify(v)), { deep: true });
 
+// ---- 界面首选项 ----
+const UI_PREFS_KEY = 'sonari.ui';
+const uiPrefs = ref<{ showHistory: boolean }>(loadUiPrefs());
+function loadUiPrefs(): { showHistory: boolean } {
+  try {
+    const v = JSON.parse(localStorage.getItem(UI_PREFS_KEY) ?? '{}');
+    return { showHistory: typeof v.showHistory === 'boolean' ? v.showHistory : true };
+  } catch {
+    return { showHistory: true };
+  }
+}
+watch(uiPrefs, (v) => localStorage.setItem(UI_PREFS_KEY, JSON.stringify(v)), { deep: true });
+
 async function openPrefs() {
   openMenu.value = '';
   showPrefs.value = true;
@@ -313,6 +364,20 @@ async function loadDevices() {
 }
 
 // ================= 绘制 =================
+
+let _infernoLut: Uint8ClampedArray | null = null;
+/** 256 级 inferno 色表（RGB 平铺） */
+function infernoLut(): Uint8ClampedArray {
+  if (_infernoLut) return _infernoLut;
+  const lut = new Uint8ClampedArray(256 * 3);
+  for (let i = 0; i < 256; i++) {
+    const m = /rgb\((\d+),(\d+),(\d+)\)/.exec(inferno(i / 255))!;
+    lut[i * 3] = +m[1];
+    lut[i * 3 + 1] = +m[2];
+    lut[i * 3 + 2] = +m[3];
+  }
+  return (_infernoLut = lut);
+}
 
 function inferno(t: number): string {
   const stops: [number, [number, number, number]][] = [
@@ -373,6 +438,19 @@ function drawOverview() {
     const y1 = mid - mn * (mid - 3);
     g.fillRect(i * colW, y0, Math.max(colW, 0.5), Math.max(y1 - y0, 1));
   }
+  // 缩放时：窗口外压暗 + 窗口框
+  const dur = d.info.durationSec;
+  if (zoomed.value && dur > 0) {
+    const { a, b } = win();
+    const x0 = (a / dur) * W;
+    const x1 = Math.max(x0 + 2, (b / dur) * W);
+    g.fillStyle = 'rgba(0,0,0,0.55)';
+    g.fillRect(0, 0, x0, H);
+    g.fillRect(x1, 0, W - x1, H);
+    g.strokeStyle = '#e8b34b';
+    g.lineWidth = 1;
+    g.strokeRect(x0 + 0.5, 0.5, x1 - x0 - 1, H - 1);
+  }
 }
 
 function drawWaveRow(canvas: HTMLCanvasElement | null, flat: number[]) {
@@ -418,16 +496,36 @@ function drawWaveRow(canvas: HTMLCanvasElement | null, flat: number[]) {
   }
 }
 
-async function fetchSpec(docId: string, ch: number): Promise<number[][]> {
-  const key = `${docId}:${ch}`;
-  const hit = specCache.get(key);
+async function fetchSpec(docId: string, ch: number, widthPx: number): Promise<SpecData> {
+  const d = activeDoc.value!;
+  if (!zoomed.value) {
+    const key = `${docId}:${ch}`;
+    const hit = specCache.get(key);
+    if (hit) return hit;
+    const r = await eng.spectrogram(docId, { fft: SPEC_FFT, hop: specHop.value, maxFrames: 1200, channel: ch });
+    const v = { frames: r.frames, hop: r.hop, begin: r.begin, fft: r.fft };
+    specCache.set(key, v);
+    return v;
+  }
+  // 缩放：只算可见窗口；左右各扩半个 FFT，让帧中心正好铺满窗口
+  const sr = d.info.sampleRate;
+  const { a, b } = win();
+  const f0 = Math.floor(a * sr);
+  const f1 = Math.ceil(b * sr);
+  const begin = Math.max(0, f0 - SPEC_FFT / 2);
+  const end = Math.min(d.info.frames, f1 + SPEC_FFT / 2);
+  const hop = Math.max(1, Math.min(specHop.value, Math.floor((f1 - f0) / Math.max(64, widthPx))));
+  const key = `${docId}:${ch}:${begin}:${end}:${hop}`;
+  const hit = zoomSpecCache.get(key);
   if (hit) return hit;
-  const r = await eng.spectrogram(docId, { fft: 1024, hop: specHop.value, maxFrames: 1200, channel: ch });
-  specCache.set(key, r.frames);
-  return r.frames;
+  const r = await eng.spectrogram(docId, { fft: SPEC_FFT, hop, begin, end, maxFrames: 4000, channel: ch });
+  const v = { frames: r.frames, hop: r.hop, begin: r.begin, fft: r.fft };
+  zoomSpecCache.set(key, v);
+  if (zoomSpecCache.size > 16) zoomSpecCache.delete(zoomSpecCache.keys().next().value!);
+  return v;
 }
 
-function drawSpecRow(canvas: HTMLCanvasElement | null, frames: number[][], sampleRate: number) {
+function drawSpecRow(canvas: HTMLCanvasElement | null, spec: SpecData, sampleRate: number) {
   if (!canvas) return;
   fitCanvas(canvas);
   const g = canvas.getContext('2d')!;
@@ -435,20 +533,59 @@ function drawSpecRow(canvas: HTMLCanvasElement | null, frames: number[][], sampl
   const H = canvas.height;
   g.fillStyle = '#000';
   g.fillRect(0, 0, W, H);
+  const { frames } = spec;
   const nf = frames.length;
   if (!nf) return;
   const nb = frames[0].length;
-  const colW = W / nf;
-  const rowH = H / nb;
-  for (let f = 0; f < nf; f++) {
-    const db = frames[f];
-    for (let b = 0; b < nb; b++) {
-      const t = 1 + db[b] / dynRange.value;
-      if (t <= 0.02) continue;
-      g.fillStyle = inferno(Math.pow(t, 0.7));
-      g.fillRect(f * colW, H - (b + 1) * rowH, Math.max(colW, 1), Math.max(rowH, 1));
+  const { a, b } = win();
+  const span = Math.max(b - a, 1e-9);
+  // 逐像素着色（ImageData + 色表），比逐 bin fillRect 快一两个数量级
+  // 列 x → 帧：第 f 帧中心 = begin + f*hop + fft/2（帧）；越界取首/末帧铺满边缘
+  const colFrame = new Int32Array(W);
+  for (let x = 0; x < W; x++) {
+    const fr = ((a + ((x + 0.5) / W) * span) * sampleRate - spec.begin - spec.fft / 2) / spec.hop;
+    colFrame[x] = Math.max(0, Math.min(nf - 1, Math.round(fr)));
+  }
+  // 行 y → bin 区间，取区间内最大值（bin 比像素多时不丢峰）
+  const rowB0 = new Int32Array(H);
+  const rowB1 = new Int32Array(H);
+  for (let y = 0; y < H; y++) {
+    const yy = H - 1 - y;
+    rowB0[y] = Math.min(nb - 1, Math.floor((yy / H) * nb));
+    rowB1[y] = Math.max(rowB0[y] + 1, Math.min(nb, Math.floor(((yy + 1) / H) * nb)));
+  }
+  const lut = infernoLut();
+  const dr = dynRange.value;
+  const img = g.createImageData(W, H);
+  const px = img.data;
+  let prevF = -1;
+  const colIdx = new Uint8Array(H);
+  for (let x = 0; x < W; x++) {
+    const f = colFrame[x];
+    if (f !== prevF) {
+      const db = frames[f];
+      for (let y = 0; y < H; y++) {
+        let m = -Infinity;
+        for (let k = rowB0[y]; k < rowB1[y]; k++) if (db[k] > m) m = db[k];
+        const t = 1 + m / dr;
+        colIdx[y] = t <= 0.02 ? 0 : Math.max(1, Math.min(255, Math.round(Math.pow(Math.min(t, 1), 0.7) * 255)));
+      }
+      prevF = f;
+    }
+    for (let y = 0; y < H; y++) {
+      const o = (y * W + x) * 4;
+      const ci = colIdx[y];
+      if (ci === 0) {
+        px[o + 3] = 255; // 黑底
+      } else {
+        px[o] = lut[ci * 3];
+        px[o + 1] = lut[ci * 3 + 1];
+        px[o + 2] = lut[ci * 3 + 2];
+        px[o + 3] = 255;
+      }
     }
   }
+  g.putImageData(img, 0, 0);
   // 频率刻度（右缘）
   g.font = '10px Consolas, monospace';
   g.textAlign = 'right';
@@ -476,19 +613,25 @@ function drawRuler() {
   g.fillStyle = '#8fa1b3';
   g.fillRect(0, 0, W, 1);
   if (!d) return;
-  const dur = d.info.durationSec;
-  if (dur <= 0) return;
-  const steps = [0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 1200, 1800, 3600];
-  const step = steps.find((s) => dur / s <= 16) ?? 3600;
-  for (let t = 0; t <= dur + 1e-9; t += step) {
-    const x = Math.round((t / dur) * W);
+  const { a, b } = win();
+  const span = b - a;
+  if (span <= 0) return;
+  const steps = [
+    0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5,
+    1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 1200, 1800, 3600,
+  ];
+  const step = steps.find((s) => span / s <= 16) ?? 3600;
+  const decimals = step >= 1 ? 0 : Math.ceil(-Math.log10(step) - 1e-9);
+  for (let i = Math.ceil(a / step - 1e-9); i * step <= b + 1e-9; i++) {
+    const t = i * step;
+    const x = Math.round(((t - a) / span) * W);
     g.fillStyle = 'rgba(255,255,255,0.06)';
     g.fillRect(x, 0, 1, H);
     g.fillStyle = '#8fa1b3';
     g.fillRect(x, 0, 1, 6);
     g.font = '10px Consolas, monospace';
     g.textAlign = 'left';
-    const label = step < 1 ? t.toFixed(1) : String(Math.round(t));
+    const label = t.toFixed(decimals);
     g.fillText(label, x + 3, 17);
   }
 }
@@ -544,31 +687,227 @@ async function drawConst() {
   }
 }
 
+// ---- 「波形和星座图」：rust_mss emd-core 0.3.0 default 指纹 ----
+const mssCanvas = ref<HTMLCanvasElement | null>(null);
+/** 按文档对象缓存：每次编辑 / 撤销都会换成新的文档对象，缓存自然失效。
+ *  键 = 时间窗（秒），长文件按窗口分块计算。 */
+const mssCache = new WeakMap<DocOpened, Map<string, MssConstellation>>();
+/** 引擎单次指纹计算的时间窗上限（秒），与后端 MAX_SECONDS 对齐 */
+const MSS_MAX_WINDOW = 600;
+/** 窗口量化粒度（秒）—— 同一窗口内复用缓存，避免平移时反复重算 */
+const MSS_WINDOW_STEP = 30;
+async function drawMss(gen: number) {
+  const c = mssCanvas.value;
+  const d = activeDoc.value;
+  if (!c || !d) return;
+  // 短文件：整段一次算完（缓存键 = "all"）
+  // 长文件：按量化窗口分块算，避免后端 O(全长) 的重采样+STFT 打爆内存
+  const dur = d.info.durationSec;
+  const whole = dur <= MSS_MAX_WINDOW;
+  let wb = 0;
+  let we = dur;
+  let key = 'all';
+  if (!whole) {
+    const { a, b } = win();
+    wb = Math.max(0, Math.floor(a / MSS_WINDOW_STEP) * MSS_WINDOW_STEP);
+    we = Math.min(dur, Math.ceil(b / MSS_WINDOW_STEP) * MSS_WINDOW_STEP);
+    if (we - wb > MSS_MAX_WINDOW) we = wb + MSS_MAX_WINDOW;
+    key = `${wb.toFixed(1)}-${we.toFixed(1)}`;
+  }
+  let buckets = mssCache.get(d);
+  if (!buckets) {
+    buckets = new Map<string, MssConstellation>();
+    mssCache.set(d, buckets);
+  }
+  let r = buckets.get(key);
+  if (!r) {
+    try {
+      r = whole
+        ? await eng.mssConstellation(d.docId)
+        : await eng.mssConstellation(d.docId, wb, we);
+    } catch (e: any) {
+      status.value = `星座图失败: ${errText(e)}`;
+      return;
+    }
+    buckets.set(key, r);
+    if (gen !== redrawGen) return;
+  }
+  const base = r.beginSec ?? 0; // 指纹的帧 0 对应的绝对秒数
+  fitCanvas(c);
+  const g = c.getContext('2d')!;
+  const W = c.width;
+  const H = c.height;
+  g.fillStyle = '#0b0e12';
+  g.fillRect(0, 0, W, H);
+  const { a, b } = win();
+  const span = Math.max(b - a, 1e-9);
+  const sec = r.hop / r.sampleRate; // 每帧秒数
+  const nb = r.binHi - r.binLo;
+  // 帧号 t 是相对指纹窗口起点的，需加 base 换算成绝对秒
+  const xOf = (t: number) => ((base + t * sec - a) / span) * W;
+  const yOf = (f: number) => H - 4 - ((f + 0.5) / nb) * (H - 8);
+  const t0 = Math.floor((a - base) / sec) - 21;
+  const t1 = Math.ceil((b - base) / sec) + 1;
+  // 频率刻度
+  g.font = '10px Consolas, monospace';
+  g.textAlign = 'right';
+  const hzPerBin = r.sampleRate / r.nFft;
+  for (const hz of [500, 1000, 1500, 2000]) {
+    const y = yOf(hz / hzPerBin - r.binLo);
+    g.fillStyle = 'rgba(255,255,255,0.07)';
+    g.fillRect(0, y, W, 1);
+    g.fillStyle = 'rgba(220,230,240,0.7)';
+    g.fillText(`${hz / 1000}k`, W - 4, y - 2);
+  }
+  // 哈希连线（窗口内太多时不画，避免糊成一片）
+  const H4 = r.hashes;
+  let inWin = 0;
+  for (let i = 0; i < H4.length; i += 4) if (H4[i] >= t0 && H4[i] <= t1) inWin++;
+  if (inWin <= 30000) {
+    g.strokeStyle = 'rgba(255,170,60,0.18)';
+    g.lineWidth = 0.7;
+    g.beginPath();
+    for (let i = 0; i < H4.length; i += 4) {
+      const t = H4[i];
+      if (t < t0 || t > t1) continue;
+      g.moveTo(xOf(t), yOf(H4[i + 1]));
+      g.lineTo(xOf(t + H4[i + 3]), yOf(H4[i + 2]));
+    }
+    g.stroke();
+  }
+  // 峰（星）：亮度按 dB
+  const P = r.peaks;
+  let maxDb = -Infinity;
+  for (let i = 2; i < P.length; i += 3) maxDb = Math.max(maxDb, P[i]);
+  for (let i = 0; i < P.length; i += 3) {
+    const t = P[i];
+    if (t < t0 || t > t1) continue;
+    const k = Math.max(0, Math.min(1, 1 - (maxDb - P[i + 2]) / 40));
+    g.fillStyle = `rgba(120,220,255,${0.3 + 0.7 * k})`;
+    g.beginPath();
+    g.arc(xOf(t), yOf(P[i + 1]), 1.4 + 1.2 * k, 0, Math.PI * 2);
+    g.fill();
+  }
+  // 说明
+  g.textAlign = 'left';
+  g.fillStyle = 'rgba(220,230,240,0.85)';
+  const capped = r.hashesUncapped > H4.length / 4 ? `（上限前 ${r.hashesUncapped}）` : '';
+  const trunc = r.hashesTruncated || r.peaksTruncated ? ' · 载荷已截断' : '';
+  const winTxt = base > 0 ? ` · 窗口 ${base.toFixed(0)}–${(base + (r.frames * sec)).toFixed(0)}s` : '';
+  g.fillText(
+    `rust_mss 0.3.0 default · fast peaks · 峰 ${P.length / 3} · 哈希 ${H4.length / 4}${capped}${trunc}${winTxt}` +
+      (inWin > 30000 ? ` · 窗口内 ${inWin} 条连线过多未画，放大查看` : ''),
+    6,
+    12,
+  );
+}
+
+let redrawGen = 0;
 async function redrawAll() {
+  const gen = ++redrawGen;
   await nextTick();
   drawOverview();
   drawRuler();
   const d = activeDoc.value;
   if (!d) return;
-  const perCh = waveCache.get(d.docId);
-  if (perCh) {
-    for (let c = 0; c < d.info.channels; c++) {
-      drawWaveRow(waveCanvases[c], perCh[c] ?? []);
+  if (view.value === 'wave' || view.value === 'both' || view.value === 'waveconst') {
+    let perCh = waveCache.get(d.docId);
+    if (zoomed.value) {
+      // 缩放：按可见窗口 + 画布像素宽重新取峰值
+      const { a, b } = win();
+      const sr = d.info.sampleRate;
+      const px = Math.max(64, waveCanvases[0]?.clientWidth ?? 1000);
+      try {
+        const w = await eng.waveform(d.docId, px, {
+          begin: Math.floor(a * sr),
+          end: Math.min(d.info.frames, Math.ceil(b * sr)),
+        });
+        if (gen !== redrawGen) return;
+        perCh = [];
+        for (let c = 0; c < w.channels; c++) perCh.push(w.data.slice(c * w.buckets * 2, (c + 1) * w.buckets * 2));
+      } catch (e: any) {
+        status.value = `波形失败: ${errText(e)}`;
+      }
+    }
+    if (perCh) {
+      for (let c = 0; c < d.info.channels; c++) drawWaveRow(waveCanvases[c], perCh[c] ?? []);
     }
   }
   if (view.value === 'spec' || view.value === 'both') {
     for (let c = 0; c < d.info.channels; c++) {
       try {
-        const frames = await fetchSpec(d.docId, c);
-        drawSpecRow(specCanvases[c], frames, d.info.sampleRate);
+        const spec = await fetchSpec(d.docId, c, specCanvases[c]?.clientWidth ?? 1000);
+        if (gen !== redrawGen) return;
+        drawSpecRow(specCanvases[c], spec, d.info.sampleRate);
       } catch (e: any) {
         status.value = `频谱失败(ch${c}): ${errText(e)}`;
       }
     }
   }
   if (view.value === 'const') await drawConst();
+  if (view.value === 'waveconst') await drawMss(gen);
 }
 
+/** 缩放/平移时：总览、标尺立即重画，取数据的行防抖 */
+let zoomTimer: number | null = null;
+function setZoomWindow(a: number, b: number) {
+  const dur = activeDoc.value?.info.durationSec ?? 0;
+  if (b - a >= dur - 1e-9) resetView();
+  else {
+    viewA.value = a;
+    viewB.value = b;
+  }
+  drawOverview();
+  drawRuler();
+  if (zoomTimer != null) clearTimeout(zoomTimer);
+  zoomTimer = window.setTimeout(() => redrawAll(), 60);
+}
+
+/** 总览条：滚轮上=放大 / 下=缩小，以鼠标所指时刻为中心 */
+function overviewWheel(e: WheelEvent) {
+  const d = activeDoc.value;
+  if (!d || d.info.durationSec <= 0) return;
+  e.preventDefault();
+  const dur = d.info.durationSec;
+  const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+  const pivot = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width)) * dur;
+  const { a, b } = win();
+  const dy = e.deltaMode === 1 ? e.deltaY * 33 : e.deltaMode === 2 ? e.deltaY * 400 : e.deltaY;
+  const factor = Math.pow(1.25, Math.max(-4, Math.min(4, dy / 100)));
+  const minSpan = Math.min(dur, Math.max(0.002, 32 / d.info.sampleRate));
+  const span = Math.max(minSpan, Math.min(dur, (b - a) * factor));
+  // 鼠标在窗口内：保持它在窗口里的相对位置；在窗口外：以它为中心
+  const rel = pivot >= a && pivot <= b && b > a ? (pivot - a) / (b - a) : 0.5;
+  const na = Math.max(0, Math.min(dur - span, pivot - rel * span));
+  setZoomWindow(na, na + span);
+}
+
+/** 总览条：按下/拖动 = 把可见窗口平移到鼠标处 */
+let ovPanning = false;
+function overviewPan(e: MouseEvent) {
+  const d = activeDoc.value;
+  if (!d || !zoomed.value) return;
+  const dur = d.info.durationSec;
+  const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+  const t = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width)) * dur;
+  const { a, b } = win();
+  const span = b - a;
+  const na = Math.max(0, Math.min(dur - span, t - span / 2));
+  setZoomWindow(na, na + span);
+}
+function overviewDown(e: MouseEvent) {
+  if (e.button !== 0) return;
+  ovPanning = true;
+  overviewPan(e);
+}
+function overviewMove(e: MouseEvent) {
+  if (ovPanning) overviewPan(e);
+}
+function overviewUp() {
+  ovPanning = false;
+}
+
+watch(activeId, () => resetView());
 watch([view, activeId], () => {
   redrawAll();
 });
@@ -600,20 +939,65 @@ const recSec = ref(0);
 let playTimer: number | null = null;
 let recTimer: number | null = null;
 
+// ---- 声道启用状态（按文档）：仅播放某声道时其余置灰并静音 ----
+const chOn = ref<Record<string, boolean[]>>({});
+function chEnabled(c: number): boolean {
+  const d = activeDoc.value;
+  const arr = d ? chOn.value[d.docId] : undefined;
+  return !arr || arr.length !== d!.info.channels || arr[c] !== false;
+}
+/** 需要传给引擎的声道列表；全部启用时返回 undefined */
+function playChannels(d: DocOpened): number[] | undefined {
+  const arr = chOn.value[d.docId];
+  if (!arr || arr.length !== d.info.channels || arr.every(Boolean)) return undefined;
+  return arr.flatMap((on, i) => (on ? [i] : []));
+}
+const allChOn = computed(() => {
+  const d = activeDoc.value;
+  return !d || !playChannels(d);
+});
+function chName(c: number, n: number): string {
+  if (n === 2) return c === 0 ? '左声道' : '右声道';
+  return `声道 #${c}`;
+}
+async function setChannels(on: boolean[] | null) {
+  closeCtx();
+  const d = activeDoc.value;
+  if (!d) return;
+  if (on) chOn.value = { ...chOn.value, [d.docId]: on };
+  else {
+    const { [d.docId]: _, ...rest } = chOn.value;
+    chOn.value = rest;
+  }
+  const list = playChannels(d);
+  status.value = list ? `仅播放：${list.map((c) => chName(c, d.info.channels)).join('、')}` : '播放全部声道';
+  // 正在播放：从当前位置按新声道设置重新开始
+  if (playing.value) await startPlayback(playheadSec.value, lastPlayEnd);
+}
+function ctxSoloChannel() {
+  const d = activeDoc.value;
+  const c = ctx.value?.ch;
+  if (!d || c == null) return;
+  setChannels(Array.from({ length: d.info.channels }, (_, i) => i === c));
+}
+
+let lastPlayEnd = 0;
 async function startPlayback(a: number, b: number) {
   const d = activeDoc.value;
   if (!d) return;
+  lastPlayEnd = b;
+  const chs = playChannels(d);
   const begin = Math.max(0, Math.floor(a * d.info.sampleRate));
   const end = Math.floor(b * d.info.sampleRate);
   try {
     await eng.playbackStop();
     try {
-      await eng.playbackStart(d.docId, begin, end, audioPrefs.value.output);
+      await eng.playbackStart(d.docId, begin, end, audioPrefs.value.output, chs);
     } catch (e: any) {
       // 首选项里的设备已失效（拔掉/改名）→ 回退系统默认设备重试一次
       if (audioPrefs.value.output && String(errText(e)).includes('未找到设备')) {
         audioPrefs.value.output = '';
-        await eng.playbackStart(d.docId, begin, end, '');
+        await eng.playbackStart(d.docId, begin, end, '', chs);
         status.value = '已回退系统默认输出设备播放';
       } else {
         throw e;
@@ -699,6 +1083,7 @@ async function toggleRecord() {
           if (i >= 0) docs.value[i] = updated;
           waveCache.delete(updated.docId);
           for (const k of [...specCache.keys()]) if (k.startsWith(updated.docId + ':')) specCache.delete(k);
+          zoomSpecCache.clear();
           markDirty(updated.docId);
           await addDoc(updated);
           status.value = `已插入录音 ${r.durationSec.toFixed(1)}s 到光标位置`;
@@ -781,8 +1166,9 @@ function xToTime(clientX: number): number {
   if (!el || !d) return 0;
   const rect = el.getBoundingClientRect();
   const cw = Math.max(1, rect.width - 60 - 8);
-  const t = ((clientX - rect.left - 60) / cw) * d.info.durationSec;
-  return Math.max(0, Math.min(d.info.durationSec, t));
+  const { a, b } = win();
+  const t = a + ((clientX - rect.left - 60) / cw) * (b - a);
+  return Math.max(a, Math.min(b, t));
 }
 
 function ovDown(e: MouseEvent) {
@@ -796,6 +1182,7 @@ function ovMove(e: MouseEvent) {
   hoverSec.value = t;
   if (dragFrom != null) {
     sel.value = { a: Math.min(dragFrom, t), b: Math.max(dragFrom, t) };
+    cursorSec.value = sel.value.a; // 播放标记跟到选区起点
   }
 }
 function ovUp(e: MouseEvent) {
@@ -805,6 +1192,8 @@ function ovUp(e: MouseEvent) {
     // 单击 → 只设光标
     sel.value = null;
     cursorSec.value = t;
+  } else if (sel.value) {
+    cursorSec.value = sel.value.a;
   }
   dragFrom = null;
 }
@@ -814,15 +1203,17 @@ function ovLeave() {
 }
 function pct(t: number): string {
   const d = activeDoc.value;
-  if (!d || d.info.durationSec <= 0) return '0%';
-  return `${(t / d.info.durationSec) * 100}%`;
+  const { a, b } = win();
+  if (!d || b - a <= 0) return '0%';
+  return `${((t - a) / (b - a)) * 100}%`;
 }
 const selStyle = computed(() => {
   if (!sel.value || !activeDoc.value) return {};
-  const dur = activeDoc.value.info.durationSec;
+  const { a, b } = win();
+  const span = Math.max(b - a, 1e-9);
   return {
-    left: `${(sel.value.a / dur) * 100}%`,
-    width: `${((sel.value.b - sel.value.a) / dur) * 100}%`,
+    left: `${((sel.value.a - a) / span) * 100}%`,
+    width: `${((sel.value.b - sel.value.a) / span) * 100}%`,
   };
 });
 
@@ -846,6 +1237,21 @@ function onKey(e: KeyboardEvent) {
   } else if (e.ctrlKey && e.key.toLowerCase() === 'a' && !typing) {
     e.preventDefault();
     ctxSelectAll();
+  } else if (e.ctrlKey && !typing && (e.key.toLowerCase() === 'y' || (e.shiftKey && e.key.toLowerCase() === 'z'))) {
+    e.preventDefault();
+    editRedo();
+  } else if (e.ctrlKey && !typing && e.key.toLowerCase() === 'z') {
+    e.preventDefault();
+    editUndo();
+  } else if (e.ctrlKey && !typing && e.key.toLowerCase() === 'x') {
+    e.preventDefault();
+    editCut();
+  } else if (e.ctrlKey && !typing && e.key.toLowerCase() === 'c') {
+    e.preventDefault();
+    editCopy();
+  } else if (e.ctrlKey && !typing && e.key.toLowerCase() === 'v') {
+    e.preventDefault();
+    editPaste();
   } else if (e.ctrlKey && e.key.toLowerCase() === 'o') {
     e.preventDefault();
     triggerOpen();
@@ -861,6 +1267,9 @@ function onKey(e: KeyboardEvent) {
   } else if (e.ctrlKey && e.key === '4') {
     e.preventDefault();
     setView('const');
+  } else if (e.ctrlKey && e.key === '5') {
+    e.preventDefault();
+    setView('waveconst');
   } else if (e.ctrlKey && e.key.toLowerCase() === 'w' && activeId.value) {
     e.preventDefault();
     closeDoc(activeId.value);
@@ -881,16 +1290,44 @@ onUnmounted(() => window.removeEventListener('keydown', onKey));
 // 频谱 hop 变化后清缓存重画
 watch(specHop, () => {
   specCache.clear();
+  zoomSpecCache.clear();
   if (view.value === 'spec' || view.value === 'both') redrawAll();
 });
 
 // ================= 右键菜单（ocenaudio 式：播放 / 查看信息） =================
-const ctx = ref<{ x: number; y: number; docId: string } | null>(null);
+/** 右键菜单：diagram = 图表区（编辑 / 播放 / 声道），file = 文件列表（信息 / 转换 / 保存 / 重命名） */
+const ctx = ref<{ x: number; y: number; docId: string; ch?: number; kind: 'diagram' | 'file' } | null>(null);
 const ctxEl = ref<HTMLElement | null>(null);
 const ctxDoc = computed(() => docs.value.find((d) => d.docId === ctx.value?.docId) ?? null);
 
-/** 全局接管右键：屏蔽 WebView2 自带的浏览器菜单（返回/刷新/另存为…） */
-function onCtx(e: MouseEvent, docId?: string) {
+/** 全局右键：只屏蔽 WebView 自带的浏览器菜单（返回/刷新/另存为…），不弹我们的菜单 */
+function onAppCtx(e: MouseEvent) {
+  const tag = (e.target as HTMLElement | null)?.tagName ?? '';
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+  e.preventDefault();
+}
+
+/** 图表区域右键：弹出菜单；落在某声道行上则带上声道号 */
+function onDiagramCtx(e: MouseEvent) {
+  if (!activeDoc.value) return;
+  let ch: number | undefined;
+  for (const el of document.elementsFromPoint(e.clientX, e.clientY)) {
+    const v = (el as HTMLElement).dataset?.ch;
+    if (v != null) {
+      ch = Number(v);
+      break;
+    }
+  }
+  onCtx(e);
+  if (ctx.value && ch != null) ctx.value.ch = ch;
+}
+
+/** 文件列表右键：文件级菜单 */
+function onFileCtx(e: MouseEvent, docId: string) {
+  onCtx(e, docId, 'file');
+}
+
+function onCtx(e: MouseEvent, docId?: string, kind: 'diagram' | 'file' = 'diagram') {
   const tag = (e.target as HTMLElement | null)?.tagName ?? '';
   // 输入框内保留原生菜单（复制/粘贴）
   if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
@@ -902,6 +1339,7 @@ function onCtx(e: MouseEvent, docId?: string) {
     x: Math.max(6, Math.min(e.clientX, window.innerWidth - 210)),
     y: Math.max(6, Math.min(e.clientY, window.innerHeight - 470)),
     docId: d?.docId ?? '',
+    kind,
   };
   nextTick(() => {
     const el = ctxEl.value;
@@ -992,6 +1430,8 @@ async function applyDocMutation(p: Promise<DocOpened>) {
     else docs.value.push(updated);
     waveCache.delete(updated.docId);
     for (const k of [...specCache.keys()]) if (k.startsWith(updated.docId + ':')) specCache.delete(k);
+    zoomSpecCache.clear();
+    resetView();
     sel.value = null;
     await addDoc(updated);
     markDirty(updated.docId);
@@ -1048,9 +1488,176 @@ function ctxSelectAll() {
   cursorSec.value = 0;
 }
 
+function ctxCloseFile() {
+  const id = ctx.value?.docId;
+  closeCtx();
+  if (id) closeDoc(id);
+}
+
 function ctxDeselect() {
   closeCtx();
   sel.value = null;
+}
+
+// ================= 编辑：剪切 / 复制 / 粘贴 / 静音 + 撤销 / 重做 =================
+const clip = ref<ClipInfo | null>(null);
+onMounted(async () => {
+  try {
+    clip.value = await eng.clipboardInfo();
+  } catch {
+    /* 剪贴板查询失败不影响其它功能 */
+  }
+});
+const hist = computed(() => activeDoc.value?.history ?? { undo: [] as string[], redo: [] as string[] });
+const canUndo = computed(() => hist.value.undo.length > 0);
+const canRedo = computed(() => hist.value.redo.length > 0);
+const hasSel = computed(() => !!sel.value && sel.value.b - sel.value.a > 1e-6);
+
+/** 选区（秒）→ 帧区间 */
+function selFrames(d: DocOpened): { begin: number; end: number } | null {
+  if (!sel.value) return null;
+  const sr = d.info.sampleRate;
+  const begin = Math.max(0, Math.round(sel.value.a * sr));
+  const end = Math.min(d.info.frames, Math.round(sel.value.b * sr));
+  return end > begin ? { begin, end } : null;
+}
+
+let editing = false;
+/** 执行一次改动文档的编辑：替换文档 + 刷新缓存/画面 + 标脏 */
+async function runEdit(
+  op: (d: DocOpened) => Promise<DocOpened>,
+  done: (before: DocOpened, after: DocOpened) => string,
+) {
+  closeCtx();
+  openMenu.value = '';
+  const d = activeDoc.value;
+  if (!d || editing || recording.value) return;
+  editing = true;
+  busy.value = true;
+  try {
+    await stopPlayback();
+    const updated = await op(d);
+    if (!updated.path) updated.path = d.path;
+    const i = docs.value.findIndex((x) => x.docId === updated.docId);
+    if (i >= 0) docs.value[i] = updated;
+    waveCache.delete(updated.docId);
+    for (const k of [...specCache.keys()]) if (k.startsWith(updated.docId + ':')) specCache.delete(k);
+    zoomSpecCache.clear();
+    markDirty(updated.docId);
+    // 时长变了：选区 / 光标 / 缩放窗口钳回文档内
+    const dur = updated.info.durationSec;
+    if (sel.value && sel.value.a >= dur) sel.value = null;
+    else if (sel.value) sel.value = { a: sel.value.a, b: Math.min(sel.value.b, dur) };
+    cursorSec.value = Math.min(cursorSec.value, dur);
+    if (viewB.value > dur) resetView();
+    status.value = done(d, updated);
+    await addDoc(updated);
+  } catch (e: any) {
+    status.value = `操作失败: ${errText(e)}`;
+  } finally {
+    busy.value = false;
+    editing = false;
+  }
+}
+
+function editCut() {
+  const d0 = activeDoc.value;
+  const r = d0 && selFrames(d0);
+  if (!r) return;
+  const a = sel.value!.a;
+  runEdit(
+    (d) => eng.docCut(d.docId, r.begin, r.end),
+    (b, u) => {
+      sel.value = null;
+      cursorSec.value = a;
+      eng.clipboardInfo().then((c) => (clip.value = c)).catch(() => {});
+      return `已剪切 ${(b.info.durationSec - u.info.durationSec).toFixed(3)}s`;
+    },
+  );
+}
+
+async function editCopy() {
+  closeCtx();
+  openMenu.value = '';
+  const d = activeDoc.value;
+  const r = d && selFrames(d);
+  if (!d || !r) return;
+  try {
+    clip.value = await eng.docCopy(d.docId, r.begin, r.end);
+    status.value = `已复制 ${clip.value.durationSec.toFixed(3)}s`;
+  } catch (e: any) {
+    status.value = `复制失败: ${errText(e)}`;
+  }
+}
+
+/** 粘贴：有选区 → 替换选区；否则插入到光标处。粘贴后选中粘进来的部分 */
+function editPaste() {
+  const d0 = activeDoc.value;
+  if (!d0 || !clip.value) return;
+  const r = selFrames(d0);
+  const at = r ? r.begin : Math.round(cursorSec.value * d0.info.sampleRate);
+  runEdit(
+    (d) => eng.docPasteClip(d.docId, r ?? { frame: at }),
+    (b, u) => {
+      const sr = u.info.sampleRate;
+      const removed = r ? (r.end - r.begin) / sr : 0;
+      const added = u.info.durationSec - b.info.durationSec + removed;
+      sel.value = { a: at / sr, b: Math.min(u.info.durationSec, at / sr + added) };
+      cursorSec.value = at / sr;
+      return `已粘贴 ${added.toFixed(3)}s`;
+    },
+  );
+}
+
+function editSilence() {
+  const d0 = activeDoc.value;
+  const r = d0 && selFrames(d0);
+  if (!d0 || !r) return;
+  const secs = (r.end - r.begin) / d0.info.sampleRate;
+  runEdit(
+    (d) => eng.docSilence(d.docId, r.begin, r.end),
+    () => `已静音 ${secs.toFixed(3)}s`,
+  );
+}
+
+function editFade(dir: 'in' | 'out') {
+  const d0 = activeDoc.value;
+  const r = d0 && selFrames(d0);
+  if (!d0 || !r) return;
+  const secs = (r.end - r.begin) / d0.info.sampleRate;
+  runEdit(
+    (d) => eng.docFade(d.docId, r.begin, r.end, dir),
+    () => `已${dir === 'in' ? '淡入' : '淡出'} ${secs.toFixed(3)}s`,
+  );
+}
+
+function editUndo(steps = 1) {
+  if (!canUndo.value) return;
+  const labels = hist.value.undo.slice(-steps).reverse();
+  runEdit((d) => eng.docUndo(d.docId, steps), () => {
+    sel.value = null; // 撤销/重做后旧选区已不对应原内容
+    return `已撤销：${labels.join('、')}`;
+  });
+}
+function editRedo(steps = 1) {
+  if (!canRedo.value) return;
+  const labels = hist.value.redo.slice(0, steps);
+  runEdit((d) => eng.docRedo(d.docId, steps), () => {
+    sel.value = null; // 撤销/重做后旧选区已不对应原内容
+    return `已重做：${labels.join('、')}`;
+  });
+}
+
+/** 历史面板：点第 i 项 = 回到「做完该项之后」的状态（0 = 原始） */
+const histItems = computed(() => [
+  { label: '原始', done: true },
+  ...hist.value.undo.map((l) => ({ label: l, done: true })),
+  ...hist.value.redo.map((l) => ({ label: l, done: false })),
+]);
+function gotoHistory(i: number) {
+  const cur = hist.value.undo.length;
+  if (i < cur) editUndo(cur - i);
+  else if (i > cur) editRedo(i - cur);
 }
 
 // ================= 「重命名…」 =================
@@ -1192,8 +1799,8 @@ const estimatedBitrate = computed(() => {
 
 async function pickSavePath() {
   const f = saveForm.value;
-  const { save } = await import('@tauri-apps/plugin-dialog');
-  const sel2 = await save({
+  const sel2 = await fileDialog({
+    mode: 'save',
     title: saveMode.value === 'export' ? '导出音频' : '另存为',
     defaultPath: f.path,
     filters: [{ name: saveFmt.value?.label ?? '音频', extensions: [f.format] }],
@@ -1342,11 +1949,11 @@ const infoSections = computed(() => {
 </script>
 
 <template>
-  <div class="app" @click="onAppClick" @contextmenu="onCtx">
+  <div class="app" @click="onAppClick" @contextmenu="onAppCtx">
     <!-- 菜单栏 -->
     <div class="menubar">
       <div class="menu" :class="{ open: openMenu === 'file' }" @click.stop="toggleMenu('file')">文件(F)
-        <div class="dropdown" v-if="openMenu === 'file'">
+        <div class="dropdown" v-if="openMenu === 'file'" @click.stop="onDropdownClick">
           <div class="mi" @click="triggerOpen"><span>打开(O)…</span><span class="sc">Ctrl+O</span></div>
           <div class="mi has-sub" :class="{ dis: !recents.length }">
             <span>最近打开(R)</span><span class="sc">▸</span>
@@ -1379,12 +1986,22 @@ const infoSections = computed(() => {
         </div>
       </div>
       <div class="menu" :class="{ open: openMenu === 'edit' }" @click.stop="toggleMenu('edit')">编辑(E)
-        <div class="dropdown" v-if="openMenu === 'edit'">
+        <div class="dropdown" v-if="openMenu === 'edit'" @click.stop="onDropdownClick">
+          <div class="mi" :class="{ dis: !canUndo }" @click="editUndo()"><span>撤销</span><span class="sc">Ctrl+Z</span></div>
+          <div class="mi" :class="{ dis: !canRedo }" @click="editRedo()"><span>重做</span><span class="sc">Ctrl+Y</span></div>
+          <div class="sep"></div>
+          <div class="mi" :class="{ dis: !hasSel }" @click="editCut"><span>剪切</span><span class="sc">Ctrl+X</span></div>
+          <div class="mi" :class="{ dis: !hasSel }" @click="editCopy"><span>复制</span><span class="sc">Ctrl+C</span></div>
+          <div class="mi" :class="{ dis: !clip || !activeDoc }" @click="editPaste"><span>粘贴</span><span class="sc">Ctrl+V</span></div>
+          <div class="mi" :class="{ dis: !hasSel }" @click="editSilence"><span>静音</span></div>
+          <div class="mi" :class="{ dis: !hasSel }" @click="editFade('in')"><span>淡入</span></div>
+          <div class="mi" :class="{ dis: !hasSel }" @click="editFade('out')"><span>淡出</span></div>
+          <div class="sep"></div>
           <div class="mi" @click="openPrefs"><span>首选项(P)…</span></div>
         </div>
       </div>
       <div class="menu" :class="{ open: openMenu === 'view' }" @click.stop="toggleMenu('view')">视图(V)
-        <div class="dropdown" v-if="openMenu === 'view'">
+        <div class="dropdown" v-if="openMenu === 'view'" @click.stop="onDropdownClick">
           <div class="mi" @click="setView('wave')">
             <span class="chk">{{ view === 'wave' ? '✓' : '' }}</span><span>波形视图(W)</span><span class="sc">Ctrl+1</span>
           </div>
@@ -1398,6 +2015,9 @@ const infoSections = computed(() => {
           <div class="mi" @click="setView('const')">
             <span class="chk">{{ view === 'const' ? '✓' : '' }}</span><span>星座图</span><span class="sc">Ctrl+4</span>
           </div>
+          <div class="mi" @click="setView('waveconst')" title="rust_mss emd-core 0.3.0 default：fast peaks + 哈希上限">
+            <span class="chk">{{ view === 'waveconst' ? '✓' : '' }}</span><span>波形和星座图</span><span class="sc">Ctrl+5</span>
+          </div>
         </div>
       </div>
       <span class="appname">Sonari</span>
@@ -1405,6 +2025,7 @@ const infoSections = computed(() => {
 
     <!-- 操作栏：图标 + LCD -->
     <div class="toolbar">
+      <div class="tb-left">
       <button class="tbtn" @click.stop="triggerOpen" title="打开文件 (Ctrl+O)">
         <svg viewBox="0 0 16 16" width="15" height="15"><path d="M1.5 3.5h4.2l1.4 1.6h7.4v7.4H1.5z" fill="#e8b34b" stroke="#b98d33" stroke-width="1"/></svg>
       </button>
@@ -1417,6 +2038,7 @@ const infoSections = computed(() => {
       <button class="tbtn" :disabled="!playing && !recording" @click.stop="stopAll" title="停止">
         <svg viewBox="0 0 16 16" width="15" height="15"><rect x="3.5" y="3.5" width="9" height="9" rx="1" fill="#d8dee5"/></svg>
       </button>
+      </div>
 
       <div class="lcd">
         <div class="lcd-top">
@@ -1427,8 +2049,10 @@ const infoSections = computed(() => {
         <div class="lcd-time">{{ lcdTime.toFixed(3) }}<span class="lcd-unit">秒</span></div>
       </div>
 
-      <span v-if="busy" class="busy">⏳ 处理中…</span>
-      <span class="filename">{{ activeDoc ? activeDoc.name : '未打开文件' }}</span>
+      <div class="tb-right">
+        <span v-if="busy" class="busy">⏳ 处理中…</span>
+        <span class="filename">{{ activeDoc ? activeDoc.name : '未打开文件' }}</span>
+      </div>
     </div>
 
     <!-- 主体：侧栏 + 视图 -->
@@ -1436,7 +2060,7 @@ const infoSections = computed(() => {
       <aside>
         <div class="side-title">已打开的文件</div>
         <div v-for="d in docs" :key="d.docId" class="fileitem" :class="{ on: d.docId === activeId }"
-          @click.stop="selectDoc(d.docId)" @contextmenu.stop="onCtx($event, d.docId)">
+          @click.stop="selectDoc(d.docId)" @contextmenu.prevent.stop="onFileCtx($event, d.docId)">
           <div class="fi-icon">🎵</div>
           <div class="fi-text">
             <div class="fi-name" :title="d.name"><span v-if="isDirty(d.docId)" class="fi-dirty">●</span>{{ d.name }}</div>
@@ -1445,27 +2069,53 @@ const infoSections = computed(() => {
           <button class="fi-close" title="关闭" @click.stop="closeDoc(d.docId)">✕</button>
         </div>
         <div v-if="!docs.length" class="side-empty">尚无打开的文件</div>
+
+        <template v-if="activeDoc && uiPrefs.showHistory">
+          <div class="side-title hist-title">
+            <span>操作历史</span>
+            <span class="hist-btns">
+              <button class="hbtn" :disabled="!canUndo || busy" title="撤销 (Ctrl+Z)" @click.stop="editUndo()">↶</button>
+              <button class="hbtn" :disabled="!canRedo || busy" title="重做 (Ctrl+Y)" @click.stop="editRedo()">↷</button>
+            </span>
+          </div>
+          <div class="hist-list">
+            <div v-for="(h, i) in histItems" :key="i" class="hist-item"
+              :class="{ cur: i === hist.undo.length, undone: !h.done }"
+              :title="i === hist.undo.length ? '当前状态' : '点击回到这一步'" @click.stop="gotoHistory(i)">
+              <span class="hist-no">{{ i === 0 ? '·' : i }}</span><span class="hist-label">{{ h.label }}</span>
+            </div>
+          </div>
+        </template>
       </aside>
 
-      <main ref="viewareaEl" class="viewarea">
+      <main ref="viewareaEl" class="viewarea" @contextmenu.prevent.stop="onDiagramCtx">
         <template v-if="activeDoc">
           <div class="trow overview-row">
             <div class="chlabel">总览</div>
-            <div class="cwrap ovwrap"><canvas ref="overviewCanvas"></canvas></div>
+            <div class="cwrap ovwrap" :class="{ zoomed }" title="滚轮：放大 / 缩小 · 拖动：平移"
+              @wheel="overviewWheel" @mousedown="overviewDown" @mousemove="overviewMove"
+              @mouseup="overviewUp" @mouseleave="overviewUp"><canvas ref="overviewCanvas"></canvas></div>
           </div>
 
           <div class="rows" ref="rowsEl">
-            <template v-if="view === 'wave' || view === 'both'">
-              <div v-for="c in chList" :key="'w' + c" class="trow">
+            <template v-if="view === 'wave' || view === 'both' || view === 'waveconst'">
+              <div v-for="c in chList" :key="'w' + c" class="trow" :data-ch="c - 1" :class="{ 'ch-off': !chEnabled(c - 1) }">
                 <div class="chlabel">#{{ c - 1 }}</div>
                 <div class="cwrap"><canvas :ref="(el) => setCanvas(waveCanvases, c - 1, el)"></canvas></div>
               </div>
             </template>
 
             <template v-if="view === 'spec' || view === 'both'">
-              <div v-for="c in chList" :key="'s' + c" class="trow">
+              <div v-for="c in chList" :key="'s' + c" class="trow" :data-ch="c - 1" :class="{ 'ch-off': !chEnabled(c - 1) }">
                 <div class="chlabel dim">spec {{ c - 1 }}</div>
                 <div class="cwrap"><canvas :ref="(el) => setCanvas(specCanvases, c - 1, el)"></canvas></div>
+              </div>
+            </template>
+
+            <template v-if="view === 'waveconst'">
+              <div class="trow mss-row">
+                <div class="chlabel dim">星座</div>
+                <div class="cwrap"><canvas ref="mssCanvas"></canvas></div>
               </div>
             </template>
 
@@ -1549,55 +2199,98 @@ const infoSections = computed(() => {
       </div>
       <div class="sep"></div>
 
-      <div class="mi" :class="{ dis: !ctxDoc }" @click.stop="ctxConvertChannels">
-        <span class="ci">⇄</span>
-        <span>{{ ctxDoc && ctxDoc.info.channels === 1 ? '转换为立体声' : '转换为单声道' }}</span>
-      </div>
-
-      <div class="mi has-sub" :class="{ dis: !ctxDoc }">
-        <span class="ci">◴</span><span>转换为</span><span class="sc">▸</span>
-        <div class="submenu submenu-rates">
-          <div v-for="r in RATES" :key="r.hz" class="mi"
-            :class="{ dis: ctxDoc && ctxDoc.info.sampleRate === r.hz }" @click.stop="ctxResample(r.hz)">
-            <span class="chk">{{ ctxDoc && ctxDoc.info.sampleRate === r.hz ? '✓' : '' }}</span>
-            <span>{{ r.label }}</span>
-          </div>
-          <div class="sep"></div>
-          <div class="mi" @click.stop="ctxResampleCustom">
-            <span class="chk"></span><span>其他…</span>
+      <!-- ===== 文件菜单（文件列表右键） ===== -->
+      <template v-if="ctx.kind === 'file'">
+        <div class="mi" :class="{ dis: !ctxDoc }" @click.stop="ctxInfo">
+          <span class="ci">ⓘ</span><span>查看信息…</span>
+        </div>
+        <div class="sep"></div>
+        <div class="mi" :class="{ dis: !ctxDoc }" @click.stop="ctxConvertChannels">
+          <span class="ci">⇄</span>
+          <span>{{ ctxDoc && ctxDoc.info.channels === 1 ? '转换为立体声' : '转换为单声道' }}</span>
+        </div>
+        <div class="mi has-sub" :class="{ dis: !ctxDoc }">
+          <span class="ci">◴</span><span>转换为</span><span class="sc">▸</span>
+          <div class="submenu submenu-rates">
+            <div v-for="r in RATES" :key="r.hz" class="mi"
+              :class="{ dis: ctxDoc && ctxDoc.info.sampleRate === r.hz }" @click.stop="ctxResample(r.hz)">
+              <span class="chk">{{ ctxDoc && ctxDoc.info.sampleRate === r.hz ? '✓' : '' }}</span>
+              <span>{{ r.label }}</span>
+            </div>
+            <div class="sep"></div>
+            <div class="mi" @click.stop="ctxResampleCustom">
+              <span class="chk"></span><span>其他…</span>
+            </div>
           </div>
         </div>
-      </div>
+        <div class="sep"></div>
+        <div class="mi" :class="{ dis: !ctxDoc }" @click.stop="ctxSave">
+          <span class="ci">💾</span><span>保存</span><span class="sc">Ctrl+S</span>
+        </div>
+        <div class="mi" :class="{ dis: !ctxDoc }" @click.stop="openSaveAs('export')">
+          <span class="ci">⇱</span><span>导出…</span>
+        </div>
+        <div class="mi" :class="{ dis: !ctxDoc }" @click.stop="openSaveAs('saveas')">
+          <span class="ci">⇱</span><span>另存为…</span><span class="sc">Ctrl+Shift+S</span>
+        </div>
+        <div class="mi" :class="{ dis: !ctxDoc }" @click.stop="ctxRename">
+          <span class="ci">✎</span><span>重命名…</span>
+        </div>
+        <div class="sep"></div>
+        <div class="mi" :class="{ dis: !ctxDoc }" @click.stop="ctxCloseFile">
+          <span class="ci">✕</span><span>关闭</span><span class="sc">Ctrl+W</span>
+        </div>
+      </template>
 
-      <div class="sep"></div>
-      <div class="mi" :class="{ dis: !ctxDoc }" @click.stop="ctxInfo">
-        <span class="ci">ⓘ</span><span>查看信息…</span>
-      </div>
-      <div class="mi" :class="{ dis: !ctxDoc }" @click.stop="ctxPlay">
-        <span class="ci">▶</span><span>播放</span><span class="sc">Space</span>
-      </div>
+      <!-- ===== 图表菜单（波形 / 频谱 / 星座区右键） ===== -->
+      <template v-else>
+        <template v-if="ctxDoc && ctxDoc.info.channels > 1">
+          <div class="mi" v-if="ctx.ch != null" @click.stop="ctxSoloChannel">
+            <span class="ci">🎧</span><span>仅播放此声道（{{ chName(ctx.ch, ctxDoc.info.channels) }}）</span>
+          </div>
+          <div class="mi" :class="{ dis: allChOn }" @click.stop="setChannels(null)">
+            <span class="ci">🔈</span><span>播放全部声道</span>
+          </div>
+          <div class="sep"></div>
+        </template>
 
-      <div class="sep"></div>
-      <div class="mi" :class="{ dis: !ctxDoc }" @click.stop="ctxSave">
-        <span class="ci">💾</span><span>保存</span><span class="sc">Ctrl+S</span>
-      </div>
-      <div class="mi" :class="{ dis: !ctxDoc }" @click.stop="openSaveAs('export')">
-        <span class="ci">⇱</span><span>导出…</span>
-      </div>
-      <div class="mi" :class="{ dis: !ctxDoc }" @click.stop="openSaveAs('saveas')">
-        <span class="ci">⇱</span><span>另存为…</span><span class="sc">Ctrl+Shift+S</span>
-      </div>
-      <div class="mi" :class="{ dis: !ctxDoc }" @click.stop="ctxRename">
-        <span class="ci">✎</span><span>重命名…</span>
-      </div>
-
-      <div class="sep"></div>
-      <div class="mi" :class="{ dis: !ctxDoc }" @click.stop="ctxSelectAll">
-        <span class="ci">▭</span><span>全选</span><span class="sc">Ctrl+A</span>
-      </div>
-      <div class="mi" :class="{ dis: !sel }" @click.stop="ctxDeselect">
-        <span class="ci"></span><span>取消选择</span>
-      </div>
+        <div class="mi" :class="{ dis: !hasSel }" @click.stop="editCut">
+          <span class="ci">✂</span><span>剪切</span><span class="sc">Ctrl+X</span>
+        </div>
+        <div class="mi" :class="{ dis: !hasSel }" @click.stop="editCopy">
+          <span class="ci">⧉</span><span>复制</span><span class="sc">Ctrl+C</span>
+        </div>
+        <div class="mi" :class="{ dis: !clip }" @click.stop="editPaste"
+          :title="clip ? `剪贴板：${clip.durationSec.toFixed(3)}s` + (hasSel ? '（替换选区）' : '（插入到光标）') : '剪贴板为空'">
+          <span class="ci">📋</span><span>粘贴</span><span class="sc">Ctrl+V</span>
+        </div>
+        <div class="mi" :class="{ dis: !hasSel }" @click.stop="editSilence">
+          <span class="ci">🔇</span><span>静音</span>
+        </div>
+        <div class="mi" :class="{ dis: !hasSel }" @click.stop="editFade('in')">
+          <span class="ci">◢</span><span>淡入</span>
+        </div>
+        <div class="mi" :class="{ dis: !hasSel }" @click.stop="editFade('out')">
+          <span class="ci">◣</span><span>淡出</span>
+        </div>
+        <div class="sep"></div>
+        <div class="mi" :class="{ dis: !canUndo }" @click.stop="editUndo()">
+          <span class="ci">↶</span><span>撤销{{ canUndo ? '：' + hist.undo[hist.undo.length - 1] : '' }}</span><span class="sc">Ctrl+Z</span>
+        </div>
+        <div class="mi" :class="{ dis: !canRedo }" @click.stop="editRedo()">
+          <span class="ci">↷</span><span>重做{{ canRedo ? '：' + hist.redo[0] : '' }}</span><span class="sc">Ctrl+Y</span>
+        </div>
+        <div class="sep"></div>
+        <div class="mi" :class="{ dis: !ctxDoc }" @click.stop="ctxPlay">
+          <span class="ci">▶</span><span>播放</span><span class="sc">Space</span>
+        </div>
+        <div class="mi" :class="{ dis: !ctxDoc }" @click.stop="ctxSelectAll">
+          <span class="ci">▭</span><span>全选</span><span class="sc">Ctrl+A</span>
+        </div>
+        <div class="mi" :class="{ dis: !sel }" @click.stop="ctxDeselect">
+          <span class="ci"></span><span>取消选择</span>
+        </div>
+      </template>
     </div>
 
     <!-- 其他采样率 -->
@@ -1741,7 +2434,14 @@ const infoSections = computed(() => {
     <!-- 首选项 -->
     <div class="modal-mask" v-if="showPrefs" @click.self="showPrefs = false">
       <div class="modal">
-        <div class="modal-title">首选项 — 音频</div>
+        <div class="modal-title">首选项</div>
+        <div class="pref-sec">界面</div>
+        <label class="chk-inline pref-chk">
+          <input type="checkbox" v-model="uiPrefs.showHistory" />
+          <span>在侧栏显示「操作历史」面板</span>
+        </label>
+
+        <div class="pref-sec">音频</div>
         <div class="pref-host">
           <span class="host-badge">{{ devices.host || '音频后端' }}</span>
           <button :disabled="busy" @click.stop="loadDevices">⟳ 刷新设备</button>
@@ -1823,7 +2523,8 @@ body { margin: 0; font: 13px/1.5 'Segoe UI', system-ui, sans-serif; background: 
 .appname { margin-left: auto; color: #1fd6a4; font-weight: 600; letter-spacing: 0.5px; }
 
 /* 操作栏 */
-.toolbar { display: flex; gap: 4px; align-items: center; background: #181d23; border-bottom: 1px solid #232b33; padding: 5px 8px; }
+/* 三栏：左按钮 / 中 LCD（始终居中）/ 右文件名 */
+.toolbar { display: grid; grid-template-columns: 1fr auto 1fr; gap: 8px; align-items: center; background: #181d23; border-bottom: 1px solid #232b33; padding: 5px 8px; }
 .tbtn { width: 32px; height: 28px; padding: 0; display: inline-flex; align-items: center; justify-content: center; background: #20262e; border: 1px solid #2c343d; border-radius: 5px; cursor: pointer; }
 .tbtn:hover:not(:disabled) { background: #2c3540; }
 .tbtn:disabled { opacity: 0.4; cursor: default; }
@@ -1831,7 +2532,9 @@ body { margin: 0; font: 13px/1.5 'Segoe UI', system-ui, sans-serif; background: 
 @keyframes recPulse { 50% { box-shadow: 0 0 2px rgba(255,90,90,0.2); } }
 
 /* LCD 电子显示屏 */
-.lcd { margin-left: 8px; background: #04120a; border: 1px solid #0f3320; border-radius: 5px; padding: 2px 12px 3px; min-width: 220px; box-shadow: inset 0 0 8px rgba(0,0,0,0.8); }
+.tb-left { display: flex; gap: 4px; align-items: center; }
+.tb-right { display: flex; gap: 8px; align-items: center; justify-content: flex-end; min-width: 0; }
+.lcd { background: #04120a; border: 1px solid #0f3320; border-radius: 5px; padding: 2px 12px 3px; min-width: 220px; box-shadow: inset 0 0 8px rgba(0,0,0,0.8); }
 .lcd-top { display: flex; gap: 12px; color: #1f9e4d; font-size: 10px; font-family: Consolas, monospace; }
 .lcd-rec { color: #ff5a5a; animation: recBlink 1s infinite; }
 @keyframes recBlink { 50% { opacity: 0.25; } }
@@ -1839,13 +2542,26 @@ body { margin: 0; font: 13px/1.5 'Segoe UI', system-ui, sans-serif; background: 
 .lcd-unit { font-size: 11px; font-weight: normal; margin-left: 6px; opacity: 0.8; }
 
 .toolbar .busy { color: #e8b34b; font-size: 12px; }
-.toolbar .filename { color: #8fa1b3; margin-left: auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.toolbar .filename { color: #8fa1b3; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* 主体 */
 .body { flex: 1; display: flex; min-height: 0; }
 aside { width: 220px; background: #171c22; border-right: 1px solid #232b33; overflow-y: auto; padding: 6px; }
 .side-title { color: #8fa1b3; font-size: 12px; padding: 4px 6px; border-bottom: 1px solid #232b33; margin-bottom: 6px; }
+.trow.ch-off canvas { filter: grayscale(1) brightness(0.55); }
+.trow.ch-off .chlabel { color: #4a5563; text-decoration: line-through; }
+.mss-row { flex: 1.4; }
 .side-empty { color: #56657a; font-size: 12px; padding: 10px 6px; }
+.pref-chk { margin: 2px 0 10px; }
+.hist-title { display: flex; align-items: center; justify-content: space-between; margin-top: 14px; }
+.hist-btns { display: inline-flex; gap: 4px; }
+.hbtn { padding: 0 8px; height: 20px; line-height: 18px; font-size: 13px; }
+.hist-list { display: flex; flex-direction: column; gap: 1px; max-height: 40vh; overflow-y: auto; }
+.hist-item { display: flex; gap: 8px; padding: 4px 8px; border-radius: 4px; cursor: pointer; font-size: 12px; color: #c3ccd6; border: 1px solid transparent; }
+.hist-item:hover { background: #222a33; }
+.hist-item.cur { background: #1b3a35; border-color: #1fd6a4; color: #e6fff7; }
+.hist-item.undone { color: #56657a; font-style: italic; }
+.hist-no { width: 18px; text-align: right; color: #6b7a8a; font-family: Consolas, monospace; }
 .fileitem { display: flex; gap: 8px; align-items: center; padding: 8px; border-radius: 6px; cursor: pointer; border: 1px solid transparent; }
 .fileitem:hover { background: #1f262e; }
 .fileitem.on { background: #1c3a4a; border-color: #1fd6a4; }
@@ -1871,7 +2587,9 @@ aside { width: 220px; background: #171c22; border-right: 1px solid #232b33; over
 .ruler-row { height: 30px; flex: none; }
 
 /* 覆盖层：光标/选区/播放头（画布列区域 = 左60px，右8px） */
-.overlay { position: absolute; left: 60px; right: 8px; top: 0; bottom: 0; cursor: text; user-select: none; }
+.overlay { position: absolute; left: 60px; right: 8px; top: 0; bottom: 0; cursor: text; user-select: none; overflow: hidden; }
+.ovwrap { user-select: none; }
+.ovwrap.zoomed { cursor: grab; }
 .sel-box { position: absolute; top: 0; bottom: 0; background: rgba(31, 214, 164, 0.14); border-left: 1px solid rgba(31,214,164,0.7); border-right: 1px solid rgba(31,214,164,0.7); pointer-events: none; }
 .cursor-fixed { position: absolute; top: 0; bottom: 0; width: 1px; background: rgba(31,214,164,0.85); pointer-events: none; z-index: 1; }
 .cursor-line { position: absolute; top: 0; bottom: 0; width: 1px; background: rgba(255,255,255,0.35); pointer-events: none; }
