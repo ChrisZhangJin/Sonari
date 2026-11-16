@@ -237,3 +237,26 @@ fn mss_constellation_produces_peaks_and_hashes() {
     // 非法窗口 → 报错
     assert!(dispatch_read(&docs, "mss_constellation", &json!({ "docId": id, "begin": 0.5, "end": 0.5 })).is_err());
 }
+
+#[test]
+fn fade_follows_custom_curve() {
+    let mut docs = Docs::new();
+    let id = open_ramp(&mut docs); // 样本值 = 帧号
+    // 曲线 [0, 1, 0.5]：区间 [0, 101) 前半 0→1，后半 1→0.5
+    let r = dispatch_write(
+        &mut docs,
+        "doc_fade",
+        &json!({ "docId": id, "begin": 0, "end": 101, "dir": "in", "curve": [0.0, 1.0, 0.5] }),
+    )
+    .unwrap();
+    let s = samples(&docs, &id);
+    assert_eq!(s[0], 0.0);
+    assert!((s[25] - 25.0 * 0.5).abs() < 1e-3); // x=0.25 → 0.5
+    assert!((s[50] - 50.0).abs() < 1e-3); // x=0.5 → 1
+    assert!((s[100] - 100.0 * 0.5).abs() < 1e-3); // x=1 → 0.5
+    assert_eq!(s[101], 101.0); // 区间外不变
+    assert!(r["history"]["undo"][0].as_str().unwrap().contains("曲线"));
+    // 非法曲线
+    assert!(dispatch_write(&mut docs, "doc_fade", &json!({ "docId": id, "begin": 0, "end": 10, "dir": "in", "curve": [1.0] })).is_err());
+    assert!(dispatch_write(&mut docs, "doc_fade", &json!({ "docId": id, "begin": 0, "end": 10, "dir": "in", "curve": ["x", 1] })).is_err());
+}

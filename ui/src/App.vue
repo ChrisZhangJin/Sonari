@@ -7,6 +7,7 @@ import {
   type DocOpened,
   type ClipInfo,
   type MssConstellation,
+  type PacketLoss,
   type ConstellationResult,
   type DocDetail,
   type EncoderCaps,
@@ -1226,6 +1227,13 @@ const lcdTime = computed(() => {
 
 // ---- 快捷键 ----
 function onKey(e: KeyboardEvent) {
+  if (fadeDlg.value) {
+    if (e.key === 'Escape') fadeDlg.value = null;
+    else if (e.key === 'Enter') applyFade();
+    else return;
+    e.preventDefault();
+    return;
+  }
   const tag = (e.target as HTMLElement | null)?.tagName ?? '';
   const typing = tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA';
   if (e.ctrlKey && e.shiftKey && e.key.toLowerCase() === 's') {
@@ -1488,6 +1496,19 @@ function ctxSelectAll() {
   cursorSec.value = 0;
 }
 
+// ---- 「查看丢包率」 ----
+const plDlg = ref<{ name: string; r: PacketLoss } | null>(null);
+async function ctxPacketLoss() {
+  const d = ctxDoc.value;
+  closeCtx();
+  if (!d) return;
+  try {
+    plDlg.value = { name: d.name, r: await eng.docPacketLoss(d.docId) };
+  } catch (e: any) {
+    status.value = `丢包率计算失败: ${errText(e)}`;
+  }
+}
+
 function ctxCloseFile() {
   const id = ctx.value?.docId;
   closeCtx();
@@ -1620,15 +1641,344 @@ function editSilence() {
   );
 }
 
-function editFade(dir: 'in' | 'out') {
-  const d0 = activeDoc.value;
-  const r = d0 && selFrames(d0);
-  if (!d0 || !r) return;
-  const secs = (r.end - r.begin) / d0.info.sampleRate;
+// ================= 淡入 / 淡出：增益曲线编辑器 =================
+type CurvePt = { x: number; y: number };
+/** 预设（按淡入定义：x = 选区内位置 0..1，y = 增益 0..1）；淡出取镜像 */
+const FADE_PRESETS: { key: string; label: string; pts: CurvePt[] }[] = [
+  { key: 'linear', label: '线性', pts: [{ x: 0, y: 0 }, { x: 1, y: 1 }] },
+  {
+    key: 'fast',
+    label: '快速（对数）',
+    pts: [{ x: 0, y: 0 }, { x: 0.15, y: 0.55 }, { x: 0.4, y: 0.85 }, { x: 1, y: 1 }],
+  },
+  {
+    key: 'slow',
+    label: '缓慢（指数）',
+    pts: [{ x: 0, y: 0 }, { x: 0.6, y: 0.15 }, { x: 0.85, y: 0.45 }, { x: 1, y: 1 }],
+  },
+  {
+    key: 's',
+    label: 'S 形',
+    pts: [{ x: 0, y: 0 }, { x: 0.25, y: 0.08 }, { x: 0.5, y: 0.5 }, { x: 0.75, y: 0.92 }, { x: 1, y: 1 }],
+  },
+  {
+    key: 'power',
+    label: '等功率',
+    pts: [0, 0.25, 0.5, 0.75, 1].map((x) => ({ x, y: Math.sin((Math.PI / 2) * x) })),
+  },
+];
+function presetPts(dir: 'in' | 'out', key: string): CurvePt[] {
+  const p = (FADE_PRESETS.find((q) => q.key === key) ?? FADE_PRESETS[0]).pts.map((q) => ({ ...q }));
+  return dir === 'in' ? p : p.map((q) => ({ x: 1 - q.x, y: q.y })).reverse();
+}
+
+/** 上次用过的曲线（按方向）存在 localStorage */
+const FADE_KEY = 'sonari.fade';
+function loadFadeCurves(): Partial<Record<'in' | 'out', CurvePt[]>> {
+  try {
+    const v = JSON.parse(localStorage.getItem(FADE_KEY) ?? '{}');
+    const ok = (a: unknown): a is CurvePt[] =>
+      Array.isArray(a) && a.length >= 2 && a.every((p) => typeof p?.x === 'number' && typeof p?.y === 'number');
+    return { in: ok(v.in) ? v.in : undefined, out: ok(v.out) ? v.out : undefined };
+  } catch {
+    return {};
+  }
+}
+
+/** 单调三次 Hermite 插值（Fritsch–Carlson）：过所有控制点、不过冲 */
+function monotoneCurve(pts: CurvePt[]): (x: number) => number {
+  const n = pts.length;
+  const xs = pts.map((p) => p.x);
+  const ys = pts.map((p) => p.y);
+  const d: number[] = [];
+  for (let i = 0; i < n - 1; i++) d.push((ys[i + 1] - ys[i]) / Math.max(xs[i + 1] - xs[i], 1e-9));
+  const m: number[] = new Array(n);
+  m[0] = d[0];
+  m[n - 1] = d[n - 2];
+  for (let i = 1; i < n - 1; i++) m[i] = d[i - 1] * d[i] <= 0 ? 0 : (d[i - 1] + d[i]) / 2;
+  for (let i = 0; i < n - 1; i++) {
+    if (d[i] === 0) {
+      m[i] = 0;
+      m[i + 1] = 0;
+      continue;
+    }
+    const a = m[i] / d[i];
+    const b = m[i + 1] / d[i];
+    const s = a * a + b * b;
+    if (s > 9) {
+      const t = 3 / Math.sqrt(s);
+      m[i] = t * a * d[i];
+      m[i + 1] = t * b * d[i];
+    }
+  }
+  return (x: number) => {
+    if (x <= xs[0]) return ys[0];
+    if (x >= xs[n - 1]) return ys[n - 1];
+    let i = 0;
+    while (i < n - 2 && x > xs[i + 1]) i++;
+    const h = xs[i + 1] - xs[i];
+    const t = (x - xs[i]) / h;
+    const t2 = t * t;
+    const t3 = t2 * t;
+    const y =
+      (2 * t3 - 3 * t2 + 1) * ys[i] +
+      (t3 - 2 * t2 + t) * h * m[i] +
+      (-2 * t3 + 3 * t2) * ys[i + 1] +
+      (t3 - t2) * h * m[i + 1];
+    return Math.max(0, Math.min(1, y));
+  };
+}
+function sampleCurve(pts: CurvePt[], n: number): number[] {
+  const f = monotoneCurve(pts);
+  return Array.from({ length: n }, (_, i) => f(i / (n - 1)));
+}
+
+const fadeDlg = ref<{
+  dir: 'in' | 'out';
+  pts: CurvePt[];
+  begin: number;
+  end: number;
+  secs: number;
+  env: number[]; // 选区波形包络（0..1）
+} | null>(null);
+const fadeCanvas = ref<HTMLCanvasElement | null>(null);
+const fadeHover = ref<CurvePt | null>(null);
+let fadeDrag = -1;
+const FADE_PAD = 14;
+
+/** 菜单「淡入… / 淡出…」：打开曲线编辑器 */
+async function editFade(dir: 'in' | 'out') {
+  closeCtx();
+  openMenu.value = '';
+  const d = activeDoc.value;
+  const r = d && selFrames(d);
+  if (!d || !r) return;
+  fadeDlg.value = {
+    dir,
+    pts: (loadFadeCurves()[dir] ?? presetPts(dir, 'linear')).map((p) => ({ ...p })),
+    begin: r.begin,
+    end: r.end,
+    secs: (r.end - r.begin) / d.info.sampleRate,
+    env: [],
+  };
+  fadeHover.value = null;
+  await nextTick();
+  drawFade();
+  try {
+    const w = await eng.waveform(d.docId, 520, r);
+    const env: number[] = [];
+    for (let b = 0; b < w.buckets; b++) {
+      let a = 0;
+      for (let c = 0; c < w.channels; c++) {
+        const o = (c * w.buckets + b) * 2;
+        a = Math.max(a, Math.abs(w.data[o]), Math.abs(w.data[o + 1]));
+      }
+      env.push(Math.min(1, a));
+    }
+    if (fadeDlg.value) {
+      fadeDlg.value.env = env;
+      drawFade();
+    }
+  } catch {
+    /* 没有包络也能编辑曲线 */
+  }
+}
+
+function setFadePreset(key: string) {
+  const f = fadeDlg.value;
+  if (!f) return;
+  f.pts = presetPts(f.dir, key);
+  drawFade();
+}
+
+function applyFade() {
+  const f = fadeDlg.value;
+  if (!f) return;
+  try {
+    localStorage.setItem(FADE_KEY, JSON.stringify({ ...loadFadeCurves(), [f.dir]: f.pts }));
+  } catch {
+    /* 存不下也不影响应用 */
+  }
+  fadeDlg.value = null;
+  const curve = sampleCurve(f.pts, 1024);
   runEdit(
-    (d) => eng.docFade(d.docId, r.begin, r.end, dir),
-    () => `已${dir === 'in' ? '淡入' : '淡出'} ${secs.toFixed(3)}s`,
+    (d) => eng.docFade(d.docId, f.begin, f.end, f.dir, curve),
+    () => `已${f.dir === 'in' ? '淡入' : '淡出'} ${f.secs.toFixed(3)}s`,
   );
+}
+
+/** 画布坐标 ↔ 曲线坐标 */
+function fadeToPx(c: HTMLCanvasElement, p: CurvePt) {
+  return {
+    x: FADE_PAD + p.x * (c.width - 2 * FADE_PAD),
+    y: FADE_PAD + (1 - p.y) * (c.height - 2 * FADE_PAD),
+  };
+}
+function fadeFromEvent(e: MouseEvent): CurvePt | null {
+  const c = fadeCanvas.value;
+  if (!c) return null;
+  const r = c.getBoundingClientRect();
+  const px = ((e.clientX - r.left) * c.width) / r.width;
+  const py = ((e.clientY - r.top) * c.height) / r.height;
+  return {
+    x: Math.max(0, Math.min(1, (px - FADE_PAD) / (c.width - 2 * FADE_PAD))),
+    y: Math.max(0, Math.min(1, 1 - (py - FADE_PAD) / (c.height - 2 * FADE_PAD))),
+  };
+}
+/** 鼠标附近（9px 内）的控制点下标，没有则 -1 */
+function fadeHit(e: MouseEvent): number {
+  const c = fadeCanvas.value;
+  const f = fadeDlg.value;
+  if (!c || !f) return -1;
+  const r = c.getBoundingClientRect();
+  const px = ((e.clientX - r.left) * c.width) / r.width;
+  const py = ((e.clientY - r.top) * c.height) / r.height;
+  let best = -1;
+  let bd = 9 * 9;
+  f.pts.forEach((p, i) => {
+    const q = fadeToPx(c, p);
+    const dd = (q.x - px) ** 2 + (q.y - py) ** 2;
+    if (dd <= bd) {
+      bd = dd;
+      best = i;
+    }
+  });
+  return best;
+}
+function fadeMoveTo(i: number, p: CurvePt) {
+  const f = fadeDlg.value!;
+  const pts = f.pts;
+  const last = pts.length - 1;
+  // 端点只能上下动；中间点夹在左右邻点之间
+  const x = i === 0 ? 0 : i === last ? 1 : Math.max(pts[i - 1].x + 0.01, Math.min(pts[i + 1].x - 0.01, p.x));
+  pts[i] = { x, y: p.y };
+}
+function fadeDown(e: MouseEvent) {
+  if (e.button !== 0) return;
+  const f = fadeDlg.value;
+  const p = fadeFromEvent(e);
+  if (!f || !p) return;
+  let i = fadeHit(e);
+  if (i < 0) {
+    // 空白处：在该 x 处插一个新点并开始拖动
+    if (p.x <= 0.01 || p.x >= 0.99) return;
+    i = f.pts.findIndex((q) => q.x > p.x);
+    f.pts.splice(i, 0, { ...p });
+  }
+  fadeDrag = i;
+  fadeMoveTo(i, p);
+  fadeHover.value = { ...f.pts[i] };
+  drawFade();
+  window.addEventListener('mousemove', fadeWinMove);
+  window.addEventListener('mouseup', fadeWinUp, { once: true });
+}
+function fadeWinMove(e: MouseEvent) {
+  const p = fadeFromEvent(e);
+  if (fadeDrag < 0 || !p || !fadeDlg.value) return;
+  fadeMoveTo(fadeDrag, p);
+  fadeHover.value = { ...fadeDlg.value.pts[fadeDrag] };
+  drawFade();
+}
+function fadeWinUp() {
+  fadeDrag = -1;
+  window.removeEventListener('mousemove', fadeWinMove);
+  drawFade();
+}
+function fadeHoverMove(e: MouseEvent) {
+  if (fadeDrag >= 0) return;
+  const f = fadeDlg.value;
+  if (!f) return;
+  const i = fadeHit(e);
+  const p = fadeFromEvent(e);
+  fadeHover.value = i >= 0 ? { ...f.pts[i] } : p ? { x: p.x, y: monotoneCurve(f.pts)(p.x) } : null;
+  if (fadeCanvas.value) fadeCanvas.value.style.cursor = i >= 0 ? 'grab' : 'crosshair';
+}
+/** 双击 / 右键：删除中间控制点 */
+function fadeDelete(e: MouseEvent) {
+  const f = fadeDlg.value;
+  const i = fadeHit(e);
+  if (!f || i <= 0 || i >= f.pts.length - 1) return;
+  f.pts.splice(i, 1);
+  drawFade();
+}
+const fadeReadout = computed(() => {
+  const f = fadeDlg.value;
+  const h = fadeHover.value;
+  if (!f || !h) return '';
+  const db = h.y <= 0 ? '−∞' : (20 * Math.log10(h.y)).toFixed(1);
+  return `${(h.x * f.secs).toFixed(3)}s · 增益 ${(h.y * 100).toFixed(0)}%（${db} dB）`;
+});
+
+function drawFade() {
+  const c = fadeCanvas.value;
+  const f = fadeDlg.value;
+  if (!c || !f) return;
+  const g = c.getContext('2d')!;
+  const W = c.width;
+  const H = c.height;
+  const iw = W - 2 * FADE_PAD;
+  const ih = H - 2 * FADE_PAD;
+  g.fillStyle = '#0d1117';
+  g.fillRect(0, 0, W, H);
+  // 网格（25% 一格）
+  g.strokeStyle = '#1d2630';
+  g.lineWidth = 1;
+  for (let k = 0; k <= 4; k++) {
+    const x = Math.round(FADE_PAD + (k / 4) * iw) + 0.5;
+    const y = Math.round(FADE_PAD + (k / 4) * ih) + 0.5;
+    g.beginPath();
+    g.moveTo(x, FADE_PAD);
+    g.lineTo(x, H - FADE_PAD);
+    g.moveTo(FADE_PAD, y);
+    g.lineTo(W - FADE_PAD, y);
+    g.stroke();
+  }
+  // 波形预览：灰 = 原始，青 = 应用曲线后
+  const curve = monotoneCurve(f.pts);
+  const mid = FADE_PAD + ih / 2;
+  const n = f.env.length;
+  if (n) {
+    const bw = iw / n;
+    for (let i = 0; i < n; i++) {
+      const x = FADE_PAD + i * bw;
+      const a = f.env[i] * (ih / 2);
+      g.fillStyle = 'rgba(143,161,179,0.28)';
+      g.fillRect(x, mid - a, Math.max(bw, 1), Math.max(2 * a, 1));
+      const ga = a * curve((i + 0.5) / n);
+      g.fillStyle = 'rgba(31,214,164,0.75)';
+      g.fillRect(x, mid - ga, Math.max(bw, 1), Math.max(2 * ga, 1));
+    }
+  }
+  // 曲线
+  g.strokeStyle = '#e8b34b';
+  g.lineWidth = 2;
+  g.beginPath();
+  for (let k = 0; k <= iw; k++) {
+    const x = k / iw;
+    const p = fadeToPx(c, { x, y: curve(x) });
+    if (k === 0) g.moveTo(p.x, p.y);
+    else g.lineTo(p.x, p.y);
+  }
+  g.stroke();
+  // 控制点
+  f.pts.forEach((pt, i) => {
+    const p = fadeToPx(c, pt);
+    g.beginPath();
+    g.arc(p.x, p.y, 5, 0, Math.PI * 2);
+    g.fillStyle = i === fadeDrag ? '#ffffff' : '#e8b34b';
+    g.fill();
+    g.strokeStyle = '#0d1117';
+    g.lineWidth = 1.5;
+    g.stroke();
+  });
+  // 轴标签
+  g.font = '10px Consolas, monospace';
+  g.fillStyle = '#6b7a8a';
+  g.textAlign = 'left';
+  g.fillText('100%', FADE_PAD + 3, FADE_PAD + 10);
+  g.fillText('0', FADE_PAD + 3, H - FADE_PAD - 3);
+  g.textAlign = 'right';
+  g.fillText(`${f.secs.toFixed(3)}s`, W - FADE_PAD - 3, H - FADE_PAD - 3);
 }
 
 function editUndo(steps = 1) {
@@ -1994,8 +2344,8 @@ const infoSections = computed(() => {
           <div class="mi" :class="{ dis: !hasSel }" @click="editCopy"><span>复制</span><span class="sc">Ctrl+C</span></div>
           <div class="mi" :class="{ dis: !clip || !activeDoc }" @click="editPaste"><span>粘贴</span><span class="sc">Ctrl+V</span></div>
           <div class="mi" :class="{ dis: !hasSel }" @click="editSilence"><span>静音</span></div>
-          <div class="mi" :class="{ dis: !hasSel }" @click="editFade('in')"><span>淡入</span></div>
-          <div class="mi" :class="{ dis: !hasSel }" @click="editFade('out')"><span>淡出</span></div>
+          <div class="mi" :class="{ dis: !hasSel }" @click="editFade('in')"><span>淡入…</span></div>
+          <div class="mi" :class="{ dis: !hasSel }" @click="editFade('out')"><span>淡出…</span></div>
           <div class="sep"></div>
           <div class="mi" @click="openPrefs"><span>首选项(P)…</span></div>
         </div>
@@ -2204,6 +2554,9 @@ const infoSections = computed(() => {
         <div class="mi" :class="{ dis: !ctxDoc }" @click.stop="ctxInfo">
           <span class="ci">ⓘ</span><span>查看信息…</span>
         </div>
+        <div class="mi" :class="{ dis: !ctxDoc }" @click.stop="ctxPacketLoss">
+          <span class="ci">📉</span><span>查看丢包率…</span>
+        </div>
         <div class="sep"></div>
         <div class="mi" :class="{ dis: !ctxDoc }" @click.stop="ctxConvertChannels">
           <span class="ci">⇄</span>
@@ -2268,10 +2621,10 @@ const infoSections = computed(() => {
           <span class="ci">🔇</span><span>静音</span>
         </div>
         <div class="mi" :class="{ dis: !hasSel }" @click.stop="editFade('in')">
-          <span class="ci">◢</span><span>淡入</span>
+          <span class="ci">◢</span><span>淡入…</span>
         </div>
         <div class="mi" :class="{ dis: !hasSel }" @click.stop="editFade('out')">
-          <span class="ci">◣</span><span>淡出</span>
+          <span class="ci">◣</span><span>淡出…</span>
         </div>
         <div class="sep"></div>
         <div class="mi" :class="{ dis: !canUndo }" @click.stop="editUndo()">
@@ -2291,6 +2644,52 @@ const infoSections = computed(() => {
           <span class="ci"></span><span>取消选择</span>
         </div>
       </template>
+    </div>
+
+    <!-- 淡入 / 淡出：增益曲线编辑器 -->
+    <div class="modal-mask" v-if="fadeDlg">
+      <div class="modal fade-modal">
+        <div class="modal-title">{{ fadeDlg.dir === 'in' ? '淡入' : '淡出' }} — 增益曲线
+          <span class="fade-sub">选区 {{ fadeDlg.secs.toFixed(3) }}s</span></div>
+        <div class="fade-presets">
+          <span class="fade-lbl">预设</span>
+          <button v-for="p in FADE_PRESETS" :key="p.key" @click="setFadePreset(p.key)">{{ p.label }}</button>
+        </div>
+        <canvas ref="fadeCanvas" class="fade-canvas" width="600" height="300"
+          @mousedown="fadeDown" @mousemove="fadeHoverMove" @mouseleave="fadeHover = null"
+          @dblclick="fadeDelete" @contextmenu.prevent.stop="fadeDelete"></canvas>
+        <div class="fade-help">拖动控制点调整曲线 · 在空白处按下添加控制点 · 双击或右键删除控制点 ·
+          灰色为原波形，青色为应用后的预览</div>
+        <div class="modal-foot">
+          <span class="pref-note fade-readout">{{ fadeReadout }}</span>
+          <button @click="fadeDlg = null">取消</button>
+          <button class="btn-pri" @click="applyFade">应用</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 查看丢包率 -->
+    <div class="modal-mask" v-if="plDlg" @click.self="plDlg = null">
+      <div class="modal modal-sm">
+        <div class="modal-title">丢包率 — {{ plDlg.name }}</div>
+        <div class="pl-rate">{{ (plDlg.r.lossRate * 100).toFixed(2) }}%</div>
+        <div class="pl-line">丢包 {{ plDlg.r.lostPackets }} / {{ plDlg.r.totalPackets }} 包（每包 {{ plDlg.r.packetMs }} ms）</div>
+        <div class="pl-line">缺口 {{ plDlg.r.gapCount }} 处，最长 {{ plDlg.r.longestGapMs.toFixed(0) }} ms</div>
+        <div class="pl-gaps" v-if="plDlg.r.gaps.length">
+          <div v-for="(g, i) in plDlg.r.gaps.slice(0, 20)" :key="i">
+            {{ g.startSec.toFixed(3) }}s · {{ g.durationMs.toFixed(0) }} ms · {{ g.packets }} 包
+          </div>
+          <div v-if="plDlg.r.gaps.length > 20">… 另有 {{ plDlg.r.gaps.length - 20 }} 处</div>
+        </div>
+        <div class="pl-note" v-if="plDlg.r.estimated">
+          ⚠ 估算值：文件中没有真实的包信息（如 RTP 序号）。这里把有声区间内长 {{ plDlg.r.packetMs }}–{{ plDlg.r.maxGapMs }} ms
+          的数字静音缺口（样本恰为 0）当作丢包；更长的静音视为正常停顿，不计入。
+        </div>
+        <div class="modal-foot">
+          <span class="pref-note"></span>
+          <button @click="plDlg = null">关闭</button>
+        </div>
+      </div>
     </div>
 
     <!-- 其他采样率 -->
@@ -2654,6 +3053,19 @@ footer .mode { margin-left: auto; color: #45536a; font-size: 11px; }
 
 /* 表单行（重命名 / 采样率 / 另存为） */
 .modal-sm { width: 420px; }
+.pl-rate { font: bold 28px Consolas, monospace; color: #e8b34b; margin: 4px 0 6px; }
+.pl-line { color: #c3ccd6; font-size: 12px; margin: 2px 0; }
+.pl-gaps { margin-top: 8px; max-height: 160px; overflow-y: auto; font: 11px Consolas, monospace; color: #8fa1b3; border: 1px solid #2c343d; border-radius: 4px; padding: 4px 8px; }
+.pl-note { margin-top: 10px; font-size: 11px; color: #b98d33; line-height: 1.5; }
+.fade-modal { width: 640px; }
+.fade-sub { margin-left: 10px; font-size: 12px; font-weight: normal; color: #6b7a8a; }
+.fade-presets { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-bottom: 10px; }
+.fade-lbl { color: #8fa1b3; font-size: 12px; margin-right: 2px; }
+.fade-canvas { display: block; width: 600px; height: 300px; border: 1px solid #2c343d; border-radius: 6px; cursor: crosshair; }
+.fade-help { margin-top: 8px; color: #6b7a8a; font-size: 11px; }
+.fade-readout { flex: 1; font-family: Consolas, monospace; color: #e8b34b; }
+.btn-pri { background: #1b4d40; border-color: #1fd6a4; color: #e6fff7; }
+.btn-pri:hover { background: #22604f; }
 .form-row { display: flex; align-items: center; gap: 10px; margin: 8px 0; }
 .form-row > label { width: 76px; flex: none; color: #8fa1b3; font-size: 12px; }
 .form-row .ro { color: #6b7a8a; font-size: 12px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

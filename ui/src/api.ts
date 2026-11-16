@@ -78,6 +78,20 @@ export interface MssConstellation {
   endSec?: number;
 }
 
+/** 「查看丢包率」：没有真实包信息时 estimated = true（按数字静音缺口估算） */
+export interface PacketLoss {
+  estimated: boolean;
+  method: string;
+  packetMs: number;
+  maxGapMs: number;
+  lostPackets: number;
+  totalPackets: number;
+  lossRate: number;
+  gapCount: number;
+  longestGapMs: number;
+  gaps: { startSec: number; durationMs: number; packets: number }[];
+}
+
 /** 剪贴板中的音频（剪切 / 复制产物） */
 export interface ClipInfo {
   frames: number;
@@ -260,9 +274,9 @@ export class Engine {
   docSilence(docId: string, begin: number, end: number): Promise<DocOpened> {
     return this.call('doc_silence', { docId, begin, end });
   }
-  /** 淡入 / 淡出（区间内线性增益） */
-  docFade(docId: string, begin: number, end: number, dir: 'in' | 'out'): Promise<DocOpened> {
-    return this.call('doc_fade', { docId, begin, end, dir });
+  /** 淡入 / 淡出：curve = 沿选区等距采样的增益（0..1）；缺省为线性 */
+  docFade(docId: string, begin: number, end: number, dir: 'in' | 'out', curve?: number[]): Promise<DocOpened> {
+    return this.call('doc_fade', { docId, begin, end, dir, ...(curve ? { curve } : {}) });
   }
   /** rust_mss emd-core 0.3.0 default 指纹（fast peaks + 哈希上限） */
   mssConstellation(docId: string, begin?: number, end?: number): Promise<MssConstellation> {
@@ -273,6 +287,9 @@ export class Engine {
   }
   docRedo(docId: string, steps = 1): Promise<DocOpened> {
     return this.call('doc_redo', { docId, steps });
+  }
+  docPacketLoss(docId: string): Promise<PacketLoss> {
+    return this.call('doc_packet_loss', { docId });
   }
   clipboardInfo(): Promise<ClipInfo | null> {
     return this.call('clipboard_info', {});

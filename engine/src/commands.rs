@@ -269,7 +269,9 @@ fn doc_silence(docs: &mut Docs, p: &Value) -> Result<Value, String> {
     Ok(commit(&id, e, label, out))
 }
 
-/// 淡入 / 淡出：区间内线性增益 0→1（dir="in"）或 1→0（dir="out"）
+/// 淡入 / 淡出：区间内的增益包络。
+/// 给 `curve`（≥2 个 0..=1 的增益，沿选区等距采样）就按它线性插值；
+/// 否则线性 0→1（dir="in"）或 1→0（dir="out"）。
 fn doc_fade(docs: &mut Docs, p: &Value) -> Result<Value, String> {
     let id = doc_id_of(p);
     let fade_in = match p.get("dir").and_then(|x| x.as_str()) {
@@ -277,20 +279,52 @@ fn doc_fade(docs: &mut Docs, p: &Value) -> Result<Value, String> {
         Some("out") => false,
         _ => return Err("dir 需为 in 或 out".into()),
     };
+    let curve: Option<Vec<f32>> = match p.get("curve") {
+        None | Some(Value::Null) => None,
+        Some(v) => {
+            let arr = v.as_array().ok_or_else(|| "curve 需为数组".to_string())?;
+            let c: Vec<f32> = arr
+                .iter()
+                .map(|x| x.as_f64().map(|g| g.clamp(0.0, 1.0) as f32))
+                .collect::<Option<_>>()
+                .ok_or_else(|| "curve 需为数值数组".to_string())?;
+            if c.len() < 2 {
+                return Err("curve 至少需要 2 个点".into());
+            }
+            Some(c)
+        }
+    };
     let e = docs.get_mut(&id)?;
     let (b, end) = span_of(p, e.buf.frames())?;
     let ch = e.buf.channels.max(1);
     let mut out = (*e.buf).clone();
     let n = end - b;
     let denom = (n.max(2) - 1) as f32;
+    let gain_at = |x: f32| -> f32 {
+        match &curve {
+            Some(c) => {
+                let pos = x * (c.len() - 1) as f32;
+                let i = (pos.floor() as usize).min(c.len() - 2);
+                let fr = pos - i as f32;
+                c[i] + (c[i + 1] - c[i]) * fr
+            }
+            None if fade_in => x,
+            None => 1.0 - x,
+        }
+    };
     for k in 0..n {
         let x = k as f32 / denom; // 0..=1
-        let g = if fade_in { x } else { 1.0 - x };
+        let g = gain_at(x);
         for v in &mut out.samples[(b + k) * ch..(b + k + 1) * ch] {
             *v *= g;
         }
     }
-    let label = format!("{} {}", if fade_in { "淡入" } else { "淡出" }, fmt_secs(n, out.sample_rate));
+    let label = format!(
+        "{} {}{}",
+        if fade_in { "淡入" } else { "淡出" },
+        fmt_secs(n, out.sample_rate),
+        if curve.is_some() { "（曲线）" } else { "" }
+    );
     Ok(commit(&id, e, label, out))
 }
 
@@ -372,6 +406,7 @@ pub fn dispatch_read(docs: &Docs, cmd: &str, p: &Value) -> Result<Value, String>
         "pcm" => pcm(docs, p),
         "clipboard_info" => Ok(clip_json(&docs.clipboard)),
         "mss_constellation" => mss_constellation(docs, p),
+        "doc_packet_loss" => doc_packet_loss(docs, p),
         other => Err(format!("unknown cmd: {other}")),
     }
 }
@@ -983,5 +1018,70 @@ fn mss_constellation(docs: &Docs, p: &Value) -> Result<Value, String> {
         "hashesTruncated": fp.hashes.len() > MAX_HASHES,
         "beginSec": begin,
         "endSec": end,
+    }))
+}
+
+/// 「查看丢包率」。音频文件里没有真实的包信息（RTP 序号 / 时间戳），所以只能估算：
+/// 把有声区间（首个到最后一个非零帧）中间的「数字静音缺口」（所有声道样本都恰为 0）
+/// 当作丢包 —— 长度 >= 1 个包（默认 20 ms）且 <= maxGapMs（默认 300 ms）的缺口按
+/// round(长度 / 包长) 计丢包数；更长的缺口视为有意的静音，不计入分子和分母。
+fn doc_packet_loss(docs: &Docs, p: &Value) -> Result<Value, String> {
+    let doc = docs.get(&doc_id_of(p))?;
+    let sr = doc.buf.sample_rate.max(1) as usize;
+    let ch = doc.buf.channels.max(1);
+    let packet_ms = as_u64(p, "packetMs", 20).clamp(5, 200) as usize;
+    let max_gap_ms = as_u64(p, "maxGapMs", 300).max(packet_ms as u64) as usize;
+    let pkt = (sr * packet_ms / 1000).max(1);
+    let max_gap = sr * max_gap_ms / 1000;
+    let frames = doc.buf.frames();
+    let silent = |f: usize| doc.buf.samples[f * ch..(f + 1) * ch].iter().all(|v| *v == 0.0);
+
+    let first = (0..frames).find(|&f| !silent(f));
+    let (lost, total, gaps, longest_ms) = match first {
+        None => (0usize, 0usize, Vec::new(), 0.0),
+        Some(first) => {
+            let last = (first..frames).rev().find(|&f| !silent(f)).unwrap_or(first);
+            let mut gaps = Vec::new();
+            let (mut lost, mut excluded, mut longest) = (0usize, 0usize, 0usize);
+            let mut f = first;
+            while f <= last {
+                if !silent(f) {
+                    f += 1;
+                    continue;
+                }
+                let start = f;
+                while f <= last && silent(f) {
+                    f += 1;
+                }
+                let len = f - start;
+                if len > max_gap {
+                    excluded += len;
+                } else if len >= pkt {
+                    let n = ((len as f64) / pkt as f64).round() as usize;
+                    lost += n;
+                    longest = longest.max(len);
+                    gaps.push(json!({
+                        "startSec": start as f64 / sr as f64,
+                        "durationMs": len as f64 * 1000.0 / sr as f64,
+                        "packets": n,
+                    }));
+                }
+            }
+            let active = last + 1 - first - excluded;
+            let total = active.div_ceil(pkt).max(lost);
+            (lost, total, gaps, longest as f64 * 1000.0 / sr as f64)
+        }
+    };
+    Ok(json!({
+        "estimated": true,
+        "method": "数字静音缺口估算（文件中没有真实的包信息）",
+        "packetMs": packet_ms,
+        "maxGapMs": max_gap_ms,
+        "lostPackets": lost,
+        "totalPackets": total,
+        "lossRate": if total > 0 { lost as f64 / total as f64 } else { 0.0 },
+        "gapCount": gaps.len(),
+        "longestGapMs": longest_ms,
+        "gaps": gaps,
     }))
 }
