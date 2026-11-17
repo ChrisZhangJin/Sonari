@@ -89,7 +89,11 @@ export interface PacketLoss {
   lossRate: number;
   gapCount: number;
   longestGapMs: number;
-  gaps: { startSec: number; durationMs: number; packets: number }[];
+  depthDb: number;
+  gaps: { startSec: number; durationMs: number; packets: number; depthDb: number }[];
+  beginSec: number;
+  endSec: number;
+  channel: number | null;
 }
 
 /** 剪贴板中的音频（剪切 / 复制产物） */
@@ -218,8 +222,34 @@ export class Engine {
   }
   spectrogram(
     docId: string,
-    o: { fft: number; hop: number; begin?: number; end?: number; maxFrames?: number; channel?: number },
-  ): Promise<{ fft: number; hop: number; sampleRate: number; begin: number; frames: number[][] }> {
+    o: {
+      fft: number;
+      hop: number;
+      begin?: number;
+      end?: number;
+      maxFrames?: number;
+      channel?: number;
+      /** 动态范围（dB）：绝对模式下在 refDb − dynRange 处裁剪 */
+      dynRange?: number;
+      /** 配色参考电平（dBFS）；缺省为本次请求的最大值 */
+      refDb?: number;
+      /** true = 旧的逐帧归一化（每帧峰值 0 dB）；默认 false = 绝对 dBFS */
+      normalize?: boolean;
+    },
+  ): Promise<{
+    fft: number;
+    hop: number;
+    sampleRate: number;
+    begin: number;
+    /** 每帧 fft/2+1 个 bin 的电平（dBFS，满幅正弦 ≈ 0 dB） */
+    frames: number[][];
+    normalized: boolean;
+    /** 本次请求范围内的最大电平（裁剪前） */
+    maxDb: number;
+    /** 裁剪底 */
+    floorDb: number;
+    dynRange: number;
+  }> {
     return this.call('spectrogram', { docId, ...o });
   }
   constellation(
@@ -279,8 +309,9 @@ export class Engine {
     return this.call('doc_fade', { docId, begin, end, dir, ...(curve ? { curve } : {}) });
   }
   /** rust_mss emd-core 0.3.0 default 指纹（fast peaks + 哈希上限） */
-  mssConstellation(docId: string, begin?: number, end?: number): Promise<MssConstellation> {
-    return this.call('mss_constellation', { docId, begin, end });
+  /** channel：只算该声道；缺省为混合单声道 */
+  mssConstellation(docId: string, begin?: number, end?: number, channel?: number): Promise<MssConstellation> {
+    return this.call('mss_constellation', { docId, begin, end, channel });
   }
   docUndo(docId: string, steps = 1): Promise<DocOpened> {
     return this.call('doc_undo', { docId, steps });
@@ -288,8 +319,13 @@ export class Engine {
   docRedo(docId: string, steps = 1): Promise<DocOpened> {
     return this.call('doc_redo', { docId, steps });
   }
-  docPacketLoss(docId: string): Promise<PacketLoss> {
-    return this.call('doc_packet_loss', { docId });
+  /** 可选区间（帧）与声道；缺省 = 整段、所有声道 */
+  docPacketLoss(docId: string, o: { begin?: number; end?: number; channel?: number } = {}): Promise<PacketLoss> {
+    return this.call('doc_packet_loss', { docId, ...o });
+  }
+  /** 抽取声道（可选区间，帧）→ 新的单声道内存文档 */
+  docExtractChannel(docId: string, channel: number, range?: { begin: number; end: number }): Promise<DocOpened> {
+    return this.call('doc_extract_channel', { docId, channel, ...range });
   }
   clipboardInfo(): Promise<ClipInfo | null> {
     return this.call('clipboard_info', {});

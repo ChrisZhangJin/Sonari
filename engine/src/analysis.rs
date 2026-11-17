@@ -54,6 +54,15 @@ pub fn spectrogram(samples: &[f32], cfg: &SpectralConfig, hop: usize) -> Vec<Spe
         return Vec::new();
     }
     let win = cfg.window_type.generate(cfg.window_size.min(n));
+    // 绝对电平（normalize=false）时补偿窗的相干增益（Hann ≈ 0.5），使满幅正弦
+    // 在其 bin 上读数 ≈ 0 dBFS。normalize=true 时逐帧除峰值，常数增益本就抵消，
+    // 为保持星座图行为逐位不变，仅在绝对路径上补偿。
+    let gain_comp = if cfg.normalize {
+        1.0
+    } else {
+        let cg = win.iter().sum::<f32>() / n as f32;
+        if cg > 1e-9 { 1.0 / cg } else { 1.0 }
+    };
     let mut fft = FftCache::new();
     let mut out = Vec::new();
     let mut buf = vec![0.0f32; n];
@@ -74,7 +83,12 @@ pub fn spectrogram(samples: &[f32], cfg: &SpectralConfig, hop: usize) -> Vec<Spe
                 buf[i] = samples[start + i] * win.get(i).copied().unwrap_or(1.0);
             }
         }
-        let mag = fft.magnitude(&buf);
+        let mut mag = fft.magnitude(&buf);
+        if gain_comp != 1.0 {
+            for m in mag.iter_mut() {
+                *m *= gain_comp;
+            }
+        }
         let db = psd_to_db(&mag, cfg.normalize, cfg.dyn_range_db);
         out.push(SpectralFrame {
             frame: frame_no,

@@ -46,6 +46,7 @@ pub const WRITE_CMDS: &[&str] = &[
     "doc_paste_clip",
     "doc_silence",
     "doc_fade",
+    "doc_extract_channel",
     "doc_undo",
     "doc_redo",
 ];
