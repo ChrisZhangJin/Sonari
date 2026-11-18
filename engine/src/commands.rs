@@ -269,7 +269,9 @@ fn doc_silence(docs: &mut Docs, p: &Value) -> Result<Value, String> {
     Ok(commit(&id, e, label, out))
 }
 
-/// 淡入 / 淡出：区间内线性增益 0→1（dir="in"）或 1→0（dir="out"）
+/// 淡入 / 淡出：区间内的增益包络。
+/// 给 `curve`（≥2 个 0..=1 的增益，沿选区等距采样）就按它线性插值；
+/// 否则线性 0→1（dir="in"）或 1→0（dir="out"）。
 fn doc_fade(docs: &mut Docs, p: &Value) -> Result<Value, String> {
     let id = doc_id_of(p);
     let fade_in = match p.get("dir").and_then(|x| x.as_str()) {
@@ -277,20 +279,52 @@ fn doc_fade(docs: &mut Docs, p: &Value) -> Result<Value, String> {
         Some("out") => false,
         _ => return Err("dir 需为 in 或 out".into()),
     };
+    let curve: Option<Vec<f32>> = match p.get("curve") {
+        None | Some(Value::Null) => None,
+        Some(v) => {
+            let arr = v.as_array().ok_or_else(|| "curve 需为数组".to_string())?;
+            let c: Vec<f32> = arr
+                .iter()
+                .map(|x| x.as_f64().map(|g| g.clamp(0.0, 1.0) as f32))
+                .collect::<Option<_>>()
+                .ok_or_else(|| "curve 需为数值数组".to_string())?;
+            if c.len() < 2 {
+                return Err("curve 至少需要 2 个点".into());
+            }
+            Some(c)
+        }
+    };
     let e = docs.get_mut(&id)?;
     let (b, end) = span_of(p, e.buf.frames())?;
     let ch = e.buf.channels.max(1);
     let mut out = (*e.buf).clone();
     let n = end - b;
     let denom = (n.max(2) - 1) as f32;
+    let gain_at = |x: f32| -> f32 {
+        match &curve {
+            Some(c) => {
+                let pos = x * (c.len() - 1) as f32;
+                let i = (pos.floor() as usize).min(c.len() - 2);
+                let fr = pos - i as f32;
+                c[i] + (c[i + 1] - c[i]) * fr
+            }
+            None if fade_in => x,
+            None => 1.0 - x,
+        }
+    };
     for k in 0..n {
         let x = k as f32 / denom; // 0..=1
-        let g = if fade_in { x } else { 1.0 - x };
+        let g = gain_at(x);
         for v in &mut out.samples[(b + k) * ch..(b + k + 1) * ch] {
             *v *= g;
         }
     }
-    let label = format!("{} {}", if fade_in { "淡入" } else { "淡出" }, fmt_secs(n, out.sample_rate));
+    let label = format!(
+        "{} {}{}",
+        if fade_in { "淡入" } else { "淡出" },
+        fmt_secs(n, out.sample_rate),
+        if curve.is_some() { "（曲线）" } else { "" }
+    );
     Ok(commit(&id, e, label, out))
 }
 
@@ -355,6 +389,7 @@ pub fn dispatch_write(docs: &mut Docs, cmd: &str, p: &Value) -> Result<Value, St
         "doc_paste_clip" => doc_paste_clip(docs, p),
         "doc_silence" => doc_silence(docs, p),
         "doc_fade" => doc_fade(docs, p),
+        "doc_extract_channel" => doc_extract_channel(docs, p),
         "doc_undo" => doc_undo(docs, p),
         "doc_redo" => doc_redo(docs, p),
         other => Err(format!("unknown cmd: {other}")),
@@ -372,6 +407,7 @@ pub fn dispatch_read(docs: &Docs, cmd: &str, p: &Value) -> Result<Value, String>
         "pcm" => pcm(docs, p),
         "clipboard_info" => Ok(clip_json(&docs.clipboard)),
         "mss_constellation" => mss_constellation(docs, p),
+        "doc_packet_loss" => doc_packet_loss(docs, p),
         other => Err(format!("unknown cmd: {other}")),
     }
 }
@@ -848,25 +884,50 @@ fn spectrogram_cmd(docs: &Docs, p: &Value) -> Result<Value, String> {
             .collect(),
     };
 
+    // 默认输出绝对电平（dBFS，满幅正弦 ≈ 0 dB），不做逐帧归一化：同一电平在
+    // 时间、缩放、声道之间颜色一致，静音/丢包缺口呈暗色。normalize=true 恢复旧的
+    // 逐帧归一化（每帧峰值 0 dB）。
+    let normalize = p.get("normalize").and_then(|x| x.as_bool()).unwrap_or(false);
     let cfg = SpectralConfig {
         fft_len: fft,
         window_size: fft,
         window_type: win,
-        dyn_range_db: dyn_db,
-        normalize: true,
+        dyn_range_db: if normalize { dyn_db } else { 240.0 },
+        normalize,
         pre_emphasis: false,
     };
     // hop 自适应：帧数超限则放大（保持总时长覆盖）
     let eff_hop = hop.max((mono.len().saturating_sub(fft)) / max_frames.max(1) + 1);
-    let frames = spectrogram(&mono, &cfg, eff_hop)
+    let mut frames = spectrogram(&mono, &cfg, eff_hop)
         .into_iter()
         .map(|f| f.db)
         .collect::<Vec<_>>();
+    // 本次请求范围内的最大电平（前端以全文件各声道的最大值作为配色参考）
+    let max_db = frames
+        .iter()
+        .flat_map(|f| f.iter().copied())
+        .fold(f32::NEG_INFINITY, f32::max);
+    let max_db = if max_db.is_finite() { max_db } else { -240.0 };
+    // 绝对模式下在 参考电平 − 动态范围 处裁剪（参考 = refDb 参数，缺省为本次最大值）。
+    // 仅影响低于显示底的值，前端按同一 refDb/dynRange 着色，裁剪处即纯黑。
+    let ref_db = p.get("refDb").and_then(|x| x.as_f64()).map(|v| v as f32).unwrap_or(max_db);
+    let floor_db = if normalize { -dyn_db } else { ref_db - dyn_db };
+    if !normalize {
+        for f in frames.iter_mut() {
+            for v in f.iter_mut() {
+                *v = v.max(floor_db);
+            }
+        }
+    }
     Ok(json!({
         "fft": fft, "hop": eff_hop,
         "sampleRate": doc.buf.sample_rate,
         "begin": begin,
         "frames": frames,
+        "normalized": normalize,
+        "maxDb": max_db,
+        "floorDb": floor_db,
+        "dynRange": dyn_db,
     }))
 }
 
@@ -939,15 +1000,24 @@ fn mss_constellation(docs: &Docs, p: &Value) -> Result<Value, String> {
             MAX_SECONDS
         ));
     }
-    // 裁剪到窗口（按帧对齐）
+    // 裁剪到窗口：按「帧」算，再乘声道数换成交错样本下标
+    // （只按 秒×采样率 切的话，立体声只取到前一半样本、且声道会错位）
     let sr = doc.buf.sample_rate.max(1);
     let ch = doc.buf.channels.max(1);
-    let b = ((begin * sr as f64) as usize).min(doc.buf.samples.len());
-    let e = ((end * sr as f64) as usize).min(doc.buf.samples.len());
-    let clipped = AudioBuffer {
-        sample_rate: doc.buf.sample_rate,
-        channels: ch,
-        samples: doc.buf.samples[b..e].to_vec(),
+    let frames = doc.buf.frames();
+    let b = ((begin * sr as f64) as usize).min(frames);
+    let e = ((end * sr as f64) as usize).min(frames).max(b);
+    let seg = &doc.buf.samples[b * ch..e * ch];
+    // channel=N：只算第 N 声道；缺省：混合单声道
+    let channel = p.get("channel").and_then(|x| x.as_u64()).map(|c| c as usize);
+    let clipped = match channel {
+        Some(c) if c >= ch => return Err(format!("声道 {c} 不存在（共 {ch} 声道）")),
+        Some(c) => AudioBuffer {
+            sample_rate: doc.buf.sample_rate,
+            channels: 1,
+            samples: seg.iter().skip(c).step_by(ch).copied().collect(),
+        },
+        None => AudioBuffer { sample_rate: doc.buf.sample_rate, channels: ch, samples: seg.to_vec() },
     };
     let y = mss::to_8k_mono(&clipped);
     let fp = mss::fingerprint(&y);
@@ -983,5 +1053,163 @@ fn mss_constellation(docs: &Docs, p: &Value) -> Result<Value, String> {
         "hashesTruncated": fp.hashes.len() > MAX_HASHES,
         "beginSec": begin,
         "endSec": end,
+        "channel": channel,
     }))
+}
+
+/// 「查看丢包率」。音频文件里没有真实的包信息（RTP 序号 / 时间戳），只能估算。
+///
+/// 丢包在解码后的音频里表现为「语音突然断掉一小段」。无损格式里断掉的是精确的 0，
+/// 但 MP3 等有损格式解码后几乎没有精确的 0（实测缺口在 −44…−72 dBFS），所以按
+/// **电平骤降**检测，而不是找 0：
+/// 1. 每 5 ms 一帧算 RMS（dBFS）；不指定声道时取各声道中最响的（所有声道都断才算断）；
+/// 2. 语音电平 = max(区间内 95 分位电平 − 20 dB, −60 dBFS)；
+/// 3. 缺口 = 一段连续帧，比左右两侧 20 ms 内的语音峰值都低 ≥ 25 dB，且长 15…maxGapMs（300）ms；
+///    更长的视为正常停顿；
+/// 4. 每个缺口按 max(1, round(时长 / 包长)) 计丢包；总包数 = 首个到最后一个语音帧的时长 / 包长。
+///
+/// 参数在合成数据上标定：语音里挖 10 个 20/40/60 ms 缺口后编码为 8 kHz 32 kbps MP3，
+/// 全部检出、干净 MP3 上 0 误报。
+fn doc_packet_loss(docs: &Docs, p: &Value) -> Result<Value, String> {
+    const HOP_MS: usize = 5;
+    const DEPTH_DB: f64 = 25.0;
+    const CONTEXT_MS: usize = 20;
+    const SPEECH_BELOW_P95_DB: f64 = 20.0;
+    const MIN_GAP_MS: usize = 15;
+    const SPEECH_FLOOR_DB: f64 = -60.0;
+
+    let doc = docs.get(&doc_id_of(p))?;
+    let sr = doc.buf.sample_rate.max(1) as usize;
+    let ch = doc.buf.channels.max(1);
+    let packet_ms = as_u64(p, "packetMs", 20).clamp(5, 200) as usize;
+    let max_gap_ms = as_u64(p, "maxGapMs", 300).max(packet_ms as u64) as usize;
+    let frames = doc.buf.frames();
+    // 可选：只看区间 [begin, end)（帧）、只看某个声道
+    let re = (as_u64(p, "end", frames as u64) as usize).min(frames);
+    let rb = (as_u64(p, "begin", 0) as usize).min(re);
+    let channel = p.get("channel").and_then(|x| x.as_u64()).map(|c| c as usize);
+    if let Some(c) = channel {
+        if c >= ch {
+            return Err(format!("声道 {c} 不存在（共 {ch} 声道）"));
+        }
+    }
+
+    // 1. 5 ms 电平
+    let hop = (sr * HOP_MS / 1000).max(1);
+    let chans: Vec<usize> = match channel {
+        Some(c) => vec![c],
+        None => (0..ch).collect(),
+    };
+    let lv: Vec<f64> = (rb..re)
+        .step_by(hop)
+        .map(|f0| {
+            let f1 = (f0 + hop).min(re);
+            chans
+                .iter()
+                .map(|&c| {
+                    let e: f64 = (f0..f1).map(|f| (doc.buf.samples[f * ch + c] as f64).powi(2)).sum();
+                    10.0 * (e / (f1 - f0) as f64).max(1e-20).log10()
+                })
+                .fold(f64::NEG_INFINITY, f64::max)
+        })
+        .collect();
+    let n = lv.len();
+    let mut sorted = lv.clone();
+    sorted.sort_by(f64::total_cmp);
+    // 下限 −60 dBFS：全静音 / 只有底噪的区间不算语音
+    let speech = (sorted.get(n * 95 / 100).copied().unwrap_or(-200.0) - SPEECH_BELOW_P95_DB).max(SPEECH_FLOOR_DB);
+    let is_speech = |i: usize| lv[i] >= speech;
+
+    // 2. 找缺口
+    let k = CONTEXT_MS / HOP_MS;
+    let max_run = max_gap_ms / HOP_MS;
+    let ctx_max = |a: usize, b: usize| lv[a..b.min(n)].iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let mut gaps = Vec::new();
+    let (mut lost, mut longest_ms) = (0usize, 0usize);
+    let mut i = 0;
+    while i < n {
+        let left = ctx_max(i.saturating_sub(k), i);
+        if i > 0 && left >= speech && lv[i] <= left - DEPTH_DB {
+            let mut j = i;
+            while j < n && lv[j] <= left - DEPTH_DB && j - i <= max_run {
+                j += 1;
+            }
+            let right = ctx_max(j, j + k);
+            let dur_ms = (j - i) * HOP_MS;
+            let floor = lv[i..j].iter().copied().fold(f64::INFINITY, f64::min);
+            if j < n && dur_ms >= MIN_GAP_MS && dur_ms <= max_gap_ms && right >= speech && floor <= right - DEPTH_DB {
+                let pk = ((dur_ms as f64 / packet_ms as f64).round() as usize).max(1);
+                lost += pk;
+                longest_ms = longest_ms.max(dur_ms);
+                gaps.push(json!({
+                    "startSec": (rb + i * hop) as f64 / sr as f64,
+                    "durationMs": dur_ms,
+                    "packets": pk,
+                    "depthDb": ((left.min(right) - floor) * 10.0).round() / 10.0,
+                }));
+                i = j;
+                continue;
+            }
+        }
+        i += 1;
+    }
+
+    // 3. 总包数：首个到最后一个语音帧
+    let total = match ((0..n).find(|&i| is_speech(i)), (0..n).rev().find(|&i| is_speech(i))) {
+        (Some(a), Some(b)) => (((b + 1 - a) * HOP_MS).div_ceil(packet_ms)).max(lost),
+        _ => 0,
+    };
+    Ok(json!({
+        "estimated": true,
+        "method": "电平骤降估算（文件中没有真实的包信息）",
+        "packetMs": packet_ms,
+        "maxGapMs": max_gap_ms,
+        "depthDb": DEPTH_DB,
+        "lostPackets": lost,
+        "totalPackets": total,
+        "lossRate": if total > 0 { lost as f64 / total as f64 } else { 0.0 },
+        "gapCount": gaps.len(),
+        "longestGapMs": longest_ms,
+        "gaps": gaps,
+        "beginSec": rb as f64 / sr as f64,
+        "endSec": re as f64 / sr as f64,
+        "channel": channel,
+    }))
+}
+
+/// 「抽取声道」：把第 `channel` 声道（可选区间 [begin, end) 帧）复制成一个新的单声道
+/// 内存文档（未关联磁盘文件，需另存为）。原文档不变。
+fn doc_extract_channel(docs: &mut Docs, p: &Value) -> Result<Value, String> {
+    let src = docs.get(&doc_id_of(p))?;
+    let ch = src.buf.channels.max(1);
+    let c = p
+        .get("channel")
+        .and_then(|x| x.as_u64())
+        .ok_or_else(|| "channel required".to_string())? as usize;
+    if c >= ch {
+        return Err(format!("声道 {c} 不存在（共 {ch} 声道）"));
+    }
+    let (b, e) = span_of(p, src.buf.frames())?;
+    let samples: Vec<f32> = src.buf.samples[b * ch..e * ch].iter().skip(c).step_by(ch).copied().collect();
+    let stem = Path::new(&src.name)
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| src.name.clone());
+    let tag = match (ch, c) {
+        (2, 0) => "L".to_string(),
+        (2, 1) => "R".to_string(),
+        _ => format!("ch{c}"),
+    };
+    let range = if b > 0 || e < src.buf.frames() {
+        let sr = src.buf.sample_rate.max(1) as f64;
+        format!("_{:.2}-{:.2}s", b as f64 / sr, e as f64 / sr)
+    } else {
+        String::new()
+    };
+    let name = format!("{stem}_{tag}{range}.wav");
+    let buf = Arc::new(AudioBuffer { sample_rate: src.buf.sample_rate, channels: 1, samples });
+    let meta = src.meta.clone();
+    let (resp, entry) = build_doc_entry(name, String::new(), buf, meta);
+    docs.inner.insert(resp["docId"].as_str().unwrap().to_string(), entry);
+    Ok(resp)
 }

@@ -237,3 +237,119 @@ fn mss_constellation_produces_peaks_and_hashes() {
     // 非法窗口 → 报错
     assert!(dispatch_read(&docs, "mss_constellation", &json!({ "docId": id, "begin": 0.5, "end": 0.5 })).is_err());
 }
+
+#[test]
+fn fade_follows_custom_curve() {
+    let mut docs = Docs::new();
+    let id = open_ramp(&mut docs); // 样本值 = 帧号
+    // 曲线 [0, 1, 0.5]：区间 [0, 101) 前半 0→1，后半 1→0.5
+    let r = dispatch_write(
+        &mut docs,
+        "doc_fade",
+        &json!({ "docId": id, "begin": 0, "end": 101, "dir": "in", "curve": [0.0, 1.0, 0.5] }),
+    )
+    .unwrap();
+    let s = samples(&docs, &id);
+    assert_eq!(s[0], 0.0);
+    assert!((s[25] - 25.0 * 0.5).abs() < 1e-3); // x=0.25 → 0.5
+    assert!((s[50] - 50.0).abs() < 1e-3); // x=0.5 → 1
+    assert!((s[100] - 100.0 * 0.5).abs() < 1e-3); // x=1 → 0.5
+    assert_eq!(s[101], 101.0); // 区间外不变
+    assert!(r["history"]["undo"][0].as_str().unwrap().contains("曲线"));
+    // 非法曲线
+    assert!(dispatch_write(&mut docs, "doc_fade", &json!({ "docId": id, "begin": 0, "end": 10, "dir": "in", "curve": [1.0] })).is_err());
+    assert!(dispatch_write(&mut docs, "doc_fade", &json!({ "docId": id, "begin": 0, "end": 10, "dir": "in", "curve": ["x", 1] })).is_err());
+}
+
+/// 立体声文档：左 = 帧号，右 = 帧号的负数
+fn open_stereo(docs: &mut Docs, frames: usize, sr: u32, l: impl Fn(usize) -> f32, r: impl Fn(usize) -> f32) -> String {
+    let mut bytes = Vec::new();
+    for i in 0..frames {
+        bytes.extend_from_slice(&l(i).to_le_bytes());
+        bytes.extend_from_slice(&r(i).to_le_bytes());
+    }
+    dispatch_write(
+        docs,
+        "doc_open_data",
+        &json!({ "name": "call.mp3", "sampleRate": sr, "channels": 2,
+                 "f32leBase64": base64::engine::general_purpose::STANDARD.encode(bytes) }),
+    )
+    .unwrap()["docId"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+#[test]
+fn extract_channel_creates_new_mono_doc() {
+    let mut docs = Docs::new();
+    let id = open_stereo(&mut docs, 1000, 1000, |i| i as f32, |i| -(i as f32));
+    // 整个右声道
+    let r = dispatch_write(&mut docs, "doc_extract_channel", &json!({ "docId": id, "channel": 1 })).unwrap();
+    let nid = r["docId"].as_str().unwrap().to_string();
+    assert_ne!(nid, id);
+    assert_eq!(r["name"], "call_R.wav");
+    assert_eq!(r["info"]["channels"], 1);
+    assert_eq!(r["info"]["frames"], 1000);
+    let s = samples(&docs, &nid);
+    assert_eq!(s[0], 0.0);
+    assert_eq!(s[999], -999.0);
+    // 左声道的区间 [100, 300)
+    let r = dispatch_write(
+        &mut docs,
+        "doc_extract_channel",
+        &json!({ "docId": id, "channel": 0, "begin": 100, "end": 300 }),
+    )
+    .unwrap();
+    assert_eq!(r["name"], "call_L_0.10-0.30s.wav");
+    let s = samples(&docs, r["docId"].as_str().unwrap());
+    assert_eq!(s.len(), 200);
+    assert_eq!(s[0], 100.0);
+    assert_eq!(s[199], 299.0);
+    // 原文档不变、越界声道报错
+    assert_eq!(samples(&docs, &id).len(), 2000);
+    assert!(dispatch_write(&mut docs, "doc_extract_channel", &json!({ "docId": id, "channel": 2 })).is_err());
+}
+
+/// 立体声星座图：必须覆盖整段（不能只算前一半样本），且按声道分别计算
+#[test]
+fn mss_constellation_per_channel_covers_whole_stereo_file() {
+    let mut docs = Docs::new();
+    let sr = 8000u32;
+    let frames = 4 * sr as usize; // 4 s
+    let tone = |i: usize| {
+        let t = i as f32 / sr as f32;
+        let f = [440.0, 880.0, 1320.0, 660.0][(t / 0.25) as usize % 4];
+        (2.0 * std::f32::consts::PI * f * t).sin() * 0.5
+    };
+    // 左声道只有前 1 s，右声道只有最后 1 s 有声音
+    let id = open_stereo(
+        &mut docs,
+        frames,
+        sr,
+        |i| if i < sr as usize { tone(i) } else { 0.0 },
+        |i| if i >= 3 * sr as usize { tone(i) } else { 0.0 },
+    );
+    let max_peak_sec = |m: &Value| -> f64 {
+        let p = m["peaks"].as_array().unwrap();
+        (0..p.len()).step_by(3).map(|k| p[k].as_f64().unwrap()).fold(-1.0, f64::max) * 0.01
+    };
+    let get = |c: Option<u64>| {
+        let mut p = json!({ "docId": id });
+        if let Some(c) = c {
+            p["channel"] = json!(c);
+        }
+        dispatch_read(&docs, "mss_constellation", &p).unwrap()
+    };
+    let mix = get(None);
+    let left = get(Some(0));
+    let right = get(Some(1));
+    assert_eq!(left["channel"], 0);
+    // 混合：最后 1 s 的右声道也要出现（旧实现只取了前一半样本，到不了 3 s 以后）
+    assert!(max_peak_sec(&mix) > 3.5, "mix max {}", max_peak_sec(&mix));
+    assert!(max_peak_sec(&left) < 1.1, "left max {}", max_peak_sec(&left));
+    assert!(max_peak_sec(&right) > 3.5, "right max {}", max_peak_sec(&right));
+    let first_right = right["peaks"][0].as_f64().unwrap() * 0.01;
+    assert!(first_right > 2.9, "right first {first_right}");
+    assert!(dispatch_read(&docs, "mss_constellation", &json!({ "docId": id, "channel": 2 })).is_err());
+}
